@@ -482,7 +482,7 @@ function buildCollectorExecutionSql(emulatorOrderId: number, tenant: string, log
 
 function renderExecutionsAsHtmlTable(rows: CollectorExecutionRow[], caption: string): string {
     if (!rows.length) {
-        return `<!doctype html><html><body><p style="font:13px sans-serif"><em>No execution rows.</em></p></body></html>`;
+        return `<!doctype html><html lang=""><body><p style="font:13px sans-serif"><em>No execution rows.</em></p></body></html>`;
     }
     // Wide layout: columns = fields, one column per execution row.
     const headerCells = rows
@@ -498,7 +498,7 @@ function renderExecutionsAsHtmlTable(rows: CollectorExecutionRow[], caption: str
             .join("");
         return `    <tr><td><code>${col}</code></td>${cells}</tr>`;
     }).join("\n");
-    return `<!doctype html><html><head><meta charset="utf-8"><style>
+    return `<!doctype html><html lang=""><head><meta charset="utf-8"><style>
 body{font:13px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;margin:8px;color:#222}
 table{border-collapse:collapse;width:100%}
 caption{text-align:left;font-weight:600;padding:4px 0 8px;font-size:14px}
@@ -1224,7 +1224,7 @@ describe("MT5 | Market order BUY | parametrized by symbol", () => {
                             execRows,
                             `collector.execution  (client_order_id='${emulatorOrderId}', client_acc_id='${login}', tenant_id='demo-uat')`,
                         )
-                        : `<!doctype html><html><body><p style="font:13px sans-serif"><strong>No rows</strong> matched <code>client_order_id='${emulatorOrderId}' AND client_acc_id='${login}' AND tenant_id='demo-uat'</code>.</p><p style="font:13px sans-serif">Reason: ${escapeHtml(blockReason ?? "unknown")}</p></body></html>`,
+                        : `<!doctype html><html lang=""><body><p style="font:13px sans-serif"><strong>No rows</strong> matched <code>client_order_id='${emulatorOrderId}' AND client_acc_id='${login}' AND tenant_id='demo-uat'</code>.</p><p style="font:13px sans-serif">Reason: ${escapeHtml(blockReason ?? "unknown")}</p></body></html>`,
                     "text/html",
                     "html",
                 );
