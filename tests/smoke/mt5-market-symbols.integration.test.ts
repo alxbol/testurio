@@ -1,0 +1,269 @@
+/**
+ * TC-MT5-MARKET-BUY-{SYMBOL}-001 — parameterized smoke for MT5 → bridge → fill happy path.
+ *
+ * Параметризация по символам: EURUSD.MT5, GBPUSD.MT5, XAUUSD.MT5, NZDUSD.MT5.
+ *
+ * Реализовано:
+ *   Step 1 — Health check (GET /v1/health/ping).
+ *   Step 2 — Place market BUY order (POST /v1/orders) с захватом orderId,
+ *            валидация по Zod-схеме из OpenAPI + семантическая проверка code === "OK".
+ *
+ * Known spec discrepancy (defect candidate):
+ *   OpenAPI declares the path as `GET /v1/ping`, but the live MT5 emulator
+ *   answers only on `GET /v1/health/ping` (`/v1/ping` → HTTP 404).
+ */
+
+import {readdirSync, readFileSync, statSync, writeFileSync} from "node:fs";
+import {randomUUID} from "node:crypto";
+import {join} from "node:path";
+import {z} from "zod";
+import {Client, HttpProtocol, type Interaction, testCase, TestScenario} from "testurio";
+import {AllureReporter} from "@testurio/reporter-allure";
+import {beforeAll, describe, expect, it} from "vitest";
+import {GetV1PingResponse, PostV1OrdersResponse} from "./mt-api.schema";
+
+type AllureAttachment = { name: string; source: string; type: string };
+type AllureStep = { name: string; attachments?: AllureAttachment[]; steps?: AllureStep[] };
+
+function writeJsonAttachment(dir: string, name: string, payload: unknown): AllureAttachment {
+    const filename = `${randomUUID()}-attachment.json`;
+    writeFileSync(join(dir, filename), JSON.stringify(payload, null, 2), "utf8");
+    return {name, source: filename, type: "application/json"};
+}
+
+function attachInteractionsToLatestAllureResult(dir: string, interactions: Interaction[]): void {
+    if (!interactions.length) return;
+    const candidates = readdirSync(dir)
+        .filter((f) => f.endsWith("-result.json"))
+        .map((f) => ({f, t: statSync(join(dir, f)).mtimeMs}))
+        .sort((a, b) => b.t - a.t);
+    if (!candidates.length) return;
+
+    const resultPath = join(dir, candidates[0].f);
+    const json = JSON.parse(readFileSync(resultPath, "utf8")) as {
+        steps?: AllureStep[];
+        attachments?: AllureAttachment[];
+    };
+    json.steps ||= [];
+    json.attachments ||= [];
+
+    for (const ix of interactions) {
+        const requestStep = json.steps.find((s) => s.name.includes("request") && s.name.includes(ix.messageType));
+        const responseStep = json.steps.find((s) => s.name.includes("onResponse") && s.name.includes(ix.messageType));
+
+        const reqAttachment = writeJsonAttachment(dir, `request: ${ix.messageType}`, {
+            method: (ix.requestPayload as { method?: string } | undefined)?.method,
+            path: (ix.requestPayload as { path?: string } | undefined)?.path,
+            ...(ix.requestPayload as object),
+            sentAt: new Date(ix.requestTimestamp).toISOString(),
+        });
+        const respAttachment = writeJsonAttachment(dir, `response: ${ix.messageType}`, {
+            ...(ix.responsePayload as object),
+            status: ix.status,
+            error: ix.error,
+            receivedAt: ix.responseTimestamp ? new Date(ix.responseTimestamp).toISOString() : null,
+            durationMs: ix.duration,
+        });
+
+        if (requestStep) {
+            (requestStep.attachments ||= []).push(reqAttachment);
+        } else {
+            json.attachments.push(reqAttachment);
+        }
+        if (responseStep) {
+            (responseStep.attachments ||= []).push(respAttachment);
+        } else {
+            json.attachments.push(respAttachment);
+        }
+    }
+
+    writeFileSync(resultPath, JSON.stringify(json, null, 2), "utf8");
+}
+
+// ---------------------------------------------------------------------------
+// Service contract (only what Step 1 needs)
+// ---------------------------------------------------------------------------
+
+interface PlaceOrderRequestBody {
+    symbol: string;
+    volume: number;
+    side: "BUY" | "SELL";
+    type: "MARKET" | "LIMIT" | "STOP";
+    login: number;
+    price?: number;
+    stopLoss?: number;
+    takeProfit?: number;
+}
+
+interface PlaceOrderResponseBody {
+    orderId: number;
+    code: string;
+    message: string;
+}
+
+interface MtEmulatorApi {
+    ping: {
+        request: { method: "GET"; path: "/v1/health/ping" };
+        response: { code: 200; body: { status?: string } };
+    };
+    placeOrder: {
+        request: { method: "POST"; path: "/v1/orders"; body: PlaceOrderRequestBody };
+        response: { code: 200; body: PlaceOrderResponseBody };
+    };
+}
+
+const PingResponseSchema = z
+    .object({
+        code: z.literal(200),
+        body: GetV1PingResponse,
+    })
+    .passthrough();
+
+const PlaceOrderResponseSchema = z
+    .object({
+        code: z.literal(200),
+        body: PostV1OrdersResponse,
+    })
+    .passthrough();
+
+// ---------------------------------------------------------------------------
+// Parameterization
+// ---------------------------------------------------------------------------
+
+interface SymbolCase {
+    symbol: string; // полное имя символа на MT5 emulator
+    tcCode: string; // короткий код в TC ID (GBPUSD, EURUSD, ...)
+    login: number; // demo-uat trader login (одна и та же MT5 учётка, см. reference_demo_uat_traders)
+    volume: number; // плановый объём для последующих шагов (Step 2+)
+    side: "BUY" | "SELL";
+}
+
+const SYMBOL_CASES: SymbolCase[] = [
+    {symbol: "EURUSD.MT5", tcCode: "EURUSD", login: 123461, volume: 0.01, side: "BUY"},
+    {symbol: "GBPUSD.MT5", tcCode: "GBPUSD", login: 123461, volume: 0.01, side: "BUY"},
+    {symbol: "XAUUSD.MT5", tcCode: "XAUUSD", login: 123461, volume: 0.01, side: "BUY"},
+    {symbol: "NZDUSD.MT5", tcCode: "NZDUSD", login: 123461, volume: 0.01, side: "BUY"},
+];
+
+// ---------------------------------------------------------------------------
+// Step 1 — Health check (один раз перед всеми Step 2 прогонами).
+// Падает → отменяет весь suite (precondition P1).
+// ---------------------------------------------------------------------------
+
+describe("MT5 | Market order BUY | parametrized by symbol", () => {
+    beforeAll(async () => {
+        const mtClient = new Client("mt5-emulator", {
+            protocol: new HttpProtocol<MtEmulatorApi>(),
+            targetAddress: {host: "192.168.8.46", port: 5001},
+        });
+
+        const scenario = new TestScenario({
+            name: "TC-MT5-MARKET-BUY / Step 1 (shared health check)",
+            components: [mtClient],
+            recording: true,
+        });
+
+        scenario.addReporter(
+            new AllureReporter({
+                resultsDir: "allure-results",
+                environmentInfo: {
+                    env: "demo-uat / test-stable",
+                    target: "192.168.8.46:5001 (MT Test emulator)",
+                    step: "1 — health check",
+                    node: process.version,
+                },
+            })
+        );
+
+        const tc = testCase("ping", (test) => {
+            const mt = test.use(mtClient);
+            mt.request("ping", {method: "GET", path: "/v1/health/ping"});
+            mt.onResponse("ping")
+                .validate(PingResponseSchema)
+                .assert("HTTP 200", (res) => res.code === 200)
+                .assert("status === 'ok'", (res) => res.body.status === "ok");
+        });
+
+        const result = await scenario.run(tc);
+        attachInteractionsToLatestAllureResult("allure-results", result.interactions ?? []);
+
+        if (!result.passed) {
+            throw new Error(
+                `Step 1 health check failed — aborting suite (precondition P1).\n${JSON.stringify(result, null, 2)}`
+            );
+        }
+    });
+
+    describe.each(SYMBOL_CASES)("MT5 | Market order $side | $symbol $volume | login $login", ({
+                                                                                                  symbol,
+                                                                                                  tcCode,
+                                                                                                  login,
+                                                                                                  volume,
+                                                                                                  side,
+                                                                                              }) => {
+        it("Step 2 — place market BUY: POST /v1/orders → 200 {code:'OK', orderId>0} (schema-validated)", async () => {
+            const mtClient = new Client("mt5-emulator", {
+                protocol: new HttpProtocol<MtEmulatorApi>(),
+                targetAddress: {host: "192.168.8.46", port: 5001},
+            });
+
+            const scenario = new TestScenario({
+                name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 2`,
+                components: [mtClient],
+                recording: true,
+            });
+
+            scenario.addReporter(
+                new AllureReporter({
+                    resultsDir: "allure-results",
+                    environmentInfo: {
+                        env: "demo-uat / test-stable",
+                        target: "192.168.8.46:5001 (MT Test emulator)",
+                        symbol,
+                        login: String(login),
+                        volume: String(volume),
+                        side,
+                        node: process.version,
+                    },
+                })
+            );
+
+            const tc = testCase(`placeOrder ${symbol} ${side} ${volume} login=${login}`, (test) => {
+                const mt = test.use(mtClient);
+
+                mt.request("placeOrder", {
+                    method: "POST",
+                    path: "/v1/orders",
+                    body: {symbol, volume, side, type: "MARKET", login},
+                });
+
+                mt.onResponse("placeOrder")
+                    .validate(PlaceOrderResponseSchema)
+                    .assert("HTTP 200", (res) => res.code === 200)
+                    .assert("code === 'OK'", (res) => res.body.code === "OK")
+                    .assert("orderId > 0", (res) => typeof res.body.orderId === "number" && res.body.orderId > 0)
+                    .assert("message is empty", (res) => res.body.message === "");
+            });
+
+            const result = await scenario.run(tc);
+
+            attachInteractionsToLatestAllureResult("allure-results", result.interactions ?? []);
+
+            expect(result.passed, JSON.stringify(result, null, 2)).toBe(true);
+            expect(result.interactions?.length, "expected one recorded interaction").toBe(1);
+            const ix = result.interactions![0];
+            expect(ix.serviceName).toBe("mt5-emulator");
+            expect(ix.messageType).toBe("placeOrder");
+            expect(ix.status).toBe("completed");
+            expect(ix.requestPayload).toMatchObject({
+                method: "POST",
+                path: "/v1/orders",
+                body: {symbol, volume, side, type: "MARKET", login},
+            });
+            const resp = ix.responsePayload as { code: number; body: PlaceOrderResponseBody };
+            expect(resp.code).toBe(200);
+            expect(resp.body.code).toBe("OK");
+            expect(resp.body.orderId).toBeGreaterThan(0);
+        });
+    });
+});
