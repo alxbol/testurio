@@ -5,15 +5,15 @@
  * Component management is inlined for simplicity.
  */
 
+import type {Component} from "../components";
 // TODO: AsyncClient and AsyncServer not yet migrated to new execution model
 // import { AsyncClient, AsyncServer, Client, Server } from "../components";
-import { Client, Server } from "../components";
-import type { Component } from "../components/base";
-import type { Interaction, TestReporter } from "../recording";
-import { ConsoleReporter, InteractionRecorder } from "../recording";
-import type { TestCaseResult, TestResult, TestStepResult } from "./execution.types";
-import type { TestCase } from "./test-case";
-import { TestCaseBuilder } from "./test-case-builder";
+import {Client, Server} from "../components";
+import type {Interaction, TestReporter} from "../recording";
+import {ConsoleReporter, InteractionRecorder} from "../recording";
+import type {TestCaseResult, TestResult, TestStepResult} from "./execution.types";
+import type {TestCase} from "./test-case";
+import {TestCaseBuilder} from "./test-case-builder";
 
 /**
  * Test scenario configuration
@@ -67,6 +67,9 @@ export class TestScenario {
 			throw new Error(`Component ${component.name} already exists`);
 		}
 		this.components.set(component.name, component);
+		if (this.config.recording) {
+			component.setRecorder?.(this.recorder);
+		}
 	}
 
 	/**
@@ -409,6 +412,9 @@ export class TestScenario {
 			component.clearUnhandledErrors();
 		}
 
+		// Snapshot recorder so we can slice off interactions captured during this test case
+		const recordedBefore = this.config.recording ? this.recorder.getInteractions().length : 0;
+
 		const result = await testCase.execute(builder, {
 			failFast: true,
 			onBeforeExecute: async () => {
@@ -452,9 +458,13 @@ export class TestScenario {
 			component.clearHooks(testCase.testCaseId);
 		}
 
-		// Record interactions if enabled
-		if (this.config.recording && finalResult.interactions) {
-			this.interactions.push(...finalResult.interactions);
+		// Record interactions if enabled — pull what the recorder captured for this case
+		if (this.config.recording) {
+			const captured = this.recorder.getInteractions().slice(recordedBefore);
+			if (captured.length > 0) {
+				finalResult = {...finalResult, interactions: captured};
+				this.interactions.push(...captured);
+			}
 		}
 
 		// Notify reporters

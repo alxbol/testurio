@@ -6,21 +6,12 @@
  * - waitResponse (strict): Error if response arrives before step starts
  */
 
-import type {
-	Address,
-	ISyncClientAdapter,
-	ISyncProtocol,
-	SyncValidationOptions,
-	TlsConfig,
-} from "../../protocols/base";
-import type { SchemaLike, SyncSchemaInput } from "../../validation";
-import { ValidationError } from "../../validation";
-import type { ITestCaseContext } from "../base/base.types";
-import type { Hook } from "../base/hook.types";
-import { ServiceComponent } from "../base/service.component";
-import type { Handler, Step, ValueOrFactory } from "../base/step.types";
-import { resolveValue } from "../base/step.types";
-import { SyncClientStepBuilder } from "./sync-client.step-builder";
+import type {Address, ISyncClientAdapter, ISyncProtocol, SyncValidationOptions, TlsConfig,} from "../../protocols/base";
+import type {SchemaLike, SyncSchemaInput} from "../../validation";
+import {ValidationError} from "../../validation";
+import type {Handler, Hook, ITestCaseContext, Step, ValueOrFactory} from "../base";
+import {resolveValue, ServiceComponent} from "../base";
+import {SyncClientStepBuilder} from "./sync-client.step-builder";
 
 interface ResponseMessage {
 	type: string;
@@ -97,6 +88,7 @@ export class Client<P extends ISyncProtocol = ISyncProtocol> extends ServiceComp
 		const params = step.params as {
 			messageType: string;
 			data?: ValueOrFactory<P["$request"]>;
+			traceId?: string;
 		};
 
 		const data = resolveValue(params.data);
@@ -110,8 +102,31 @@ export class Client<P extends ISyncProtocol = ISyncProtocol> extends ServiceComp
 		const preMatchMessage: ResponseMessage = { type: params.messageType, payload: undefined };
 		const matchingHooks = this.findAllMatchingHooks(preMatchMessage);
 
+		// Begin recording (no-op if no recorder attached)
+		const interactionId = this.recorder?.startInteraction({
+			serviceName: this.name,
+			direction: "downstream",
+			protocol: this.protocol.type,
+			messageType: params.messageType,
+			traceId: params.traceId,
+			requestPayload: data,
+		});
+
 		// Start request (don't await)
 		const requestPromise = this.request(params.messageType, data);
+
+		if (interactionId) {
+			requestPromise
+				.then((response) => {
+					this.recorder?.completeInteraction(interactionId, {responsePayload: response});
+				})
+				.catch((error) => {
+					this.recorder?.failInteraction(
+						interactionId,
+						error instanceof Error ? error.message : String(error),
+					);
+				});
+		}
 
 		// Resolve hooks when response arrives
 		for (const hook of matchingHooks) {

@@ -7,19 +7,29 @@
  * 3. clearHooks() - Cleanup after execution
  */
 
-import { createDeferred, generateId } from "../../utils";
-import type { Component, ComponentState, ITestCaseContext } from "./base.types";
-import type { Hook } from "./hook.types";
-import type { Handler, Step } from "./step.types";
+import type {InteractionRecorder} from "../../recording";
+import {createDeferred, generateId} from "../../utils";
+import type {Component, ComponentState, ITestCaseContext} from "./base.types";
+import type {Hook} from "./hook.types";
+import type {Handler, Step} from "./step.types";
 
 export abstract class BaseComponent<TStepBuilder = unknown> implements Component<TStepBuilder> {
 	readonly name: string;
 	protected state: ComponentState = "created";
 	protected hooks: Hook[] = [];
 	protected unhandledErrors: Error[] = [];
+	protected recorder?: InteractionRecorder;
 
 	constructor(name: string) {
 		this.name = name;
+	}
+
+	/**
+	 * Attach an InteractionRecorder so the component reports request/response
+	 * pairs into `result.interactions`. Set by TestScenario when `recording: true`.
+	 */
+	setRecorder(recorder: InteractionRecorder | undefined): void {
+		this.recorder = recorder;
 	}
 
 	// =========================================================================

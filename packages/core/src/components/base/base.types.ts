@@ -5,8 +5,8 @@
  * TestScenario and TestCaseBuilder to work with any component type.
  */
 
-import type { Hook } from "./hook.types";
-import type { Step } from "./step.types";
+import type {Hook} from "./hook.types";
+import type {Step} from "./step.types";
 
 // =============================================================================
 // Component Interface
@@ -90,6 +90,13 @@ export interface Component<TStepBuilder = unknown> {
 
 	/** Clear unhandled errors */
 	clearUnhandledErrors(): void;
+
+	/**
+	 * Attach an InteractionRecorder for request/response recording.
+	 * Called by TestScenario when `recording: true`. Optional for components
+	 * that don't produce recordable interactions.
+	 */
+	setRecorder?(recorder: import("../../recording").InteractionRecorder | undefined): void;
 }
 
 // =============================================================================
