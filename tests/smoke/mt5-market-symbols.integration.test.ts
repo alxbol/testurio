@@ -19,6 +19,11 @@
  *            эмулятора. Схема таблицы отличается от спеки (нет lp_response_at/executed_at),
  *            проверяем bridge_status/client_status вместо state, requested_core_amount
  *            вместо volume, client_amount_filled вместо filled_volume.
+ *   Step 6 — ClickHouse `collector.execution`: проверяем ≥1 fill-execution для ордера
+ *            (corr по client_order_id+client_acc_id), routing=ABOOK, execution_type=FILLED,
+ *            tenant_id, lp_request_at/lp_executed_at/lp_response_at NOT NULL,
+ *            SUM(client_amount_filled WHERE FILLED) > 0. Schema-замена: `type=FILL` из
+ *            спеки → `execution_type=FILLED`, `filled_volume` → `client_amount_filled`.
  *
  * Known spec discrepancy (defect candidate):
  *   OpenAPI declares the path as `GET /v1/ping`, but the live MT5 emulator
@@ -346,7 +351,7 @@ function renderRowAsHtmlTable(row: CollectorOrderRow, caption: string): string {
             : escapeHtml(String(v));
         return `    <tr><td><code>${col}</code></td><td>${cell}</td></tr>`;
     }).join("\n");
-    return `<!doctype html><html><head><meta charset="utf-8"><style>
+    return `<!doctype html><html lang=""><head><meta charset="utf-8"><style>
 body{font:13px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;margin:8px;color:#222}
 table{border-collapse:collapse;width:100%}
 caption{text-align:left;font-weight:600;padding:4px 0 8px;font-size:14px}
@@ -390,6 +395,146 @@ async function waitForCollectorOrder(opts: {
     }
     throw new Error(
         `collector.order: no row with client_order_id='${opts.emulatorOrderId}' client_acc_id='${opts.login}' tenant_id='${opts.tenant}' is_completed=1 ` +
+        `after ${CH_POLL_TIMEOUT_MS}ms (polls=${polls})`,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ClickHouse collector.execution (Step 6)
+// ---------------------------------------------------------------------------
+
+interface CollectorExecutionRow {
+    collector_execution_id: string;
+    order_id: string;
+    client_order_id: string;
+    routing: string;
+    generated_by: string;
+    execution_type: string;
+    side: string;
+    request_source: string;
+    tenant_id: string;
+    server_type: string;
+    server_name: string;
+    created_at: string;
+    client_amount_filled: number | null;
+    client_price_filled: number | null;
+    lp_amount_filled: number | null;
+    lp_price_filled: number | null;
+    matched_price: number | null;
+    lp_request_at: string | null;
+    lp_executed_at: string | null;
+    lp_response_at: string | null;
+    lp_execution_id: string;
+    client_acc_id: string;
+    client_acc_group: string;
+    client_symbol_name: string;
+    order_type: string;
+    pricing_mode: string;
+    time_in_force: string;
+    trading_lp_name: string;
+    quote_lp_name: string;
+    reject_reason: number | null;
+    reject_text: string;
+}
+
+const COLLECTOR_EXECUTION_COLUMNS = [
+    "collector_execution_id",
+    "order_id",
+    "client_order_id",
+    "routing",
+    "generated_by",
+    "execution_type",
+    "side",
+    "request_source",
+    "tenant_id",
+    "server_type",
+    "server_name",
+    "created_at",
+    "client_amount_filled",
+    "client_price_filled",
+    "lp_amount_filled",
+    "lp_price_filled",
+    "matched_price",
+    "lp_request_at",
+    "lp_executed_at",
+    "lp_response_at",
+    "lp_execution_id",
+    "client_acc_id",
+    "client_acc_group",
+    "client_symbol_name",
+    "order_type",
+    "pricing_mode",
+    "time_in_force",
+    "trading_lp_name",
+    "quote_lp_name",
+    "reject_reason",
+    "reject_text",
+] as const;
+
+function buildCollectorExecutionSql(emulatorOrderId: number, tenant: string, login: number): string {
+    return `SELECT ${COLLECTOR_EXECUTION_COLUMNS.join(", ")}
+            FROM collector.execution
+            WHERE client_order_id = '${emulatorOrderId}'
+              AND client_acc_id = '${login}'
+              AND tenant_id = '${tenant}'
+            ORDER BY lp_executed_at ASC, created_at ASC`;
+}
+
+function renderExecutionsAsHtmlTable(rows: CollectorExecutionRow[], caption: string): string {
+    if (!rows.length) {
+        return `<!doctype html><html><body><p style="font:13px sans-serif"><em>No execution rows.</em></p></body></html>`;
+    }
+    // Wide layout: columns = fields, one column per execution row.
+    const headerCells = rows
+        .map((_, i) => `<th>execution #${i + 1}</th>`)
+        .join("");
+    const bodyRows = COLLECTOR_EXECUTION_COLUMNS.map((col) => {
+        const cells = rows
+            .map((r) => {
+                const v = (r as unknown as Record<string, unknown>)[col];
+                const isNull = v === null || v === undefined;
+                return `<td>${isNull ? '<em style="color:#888">null</em>' : escapeHtml(String(v))}</td>`;
+            })
+            .join("");
+        return `    <tr><td><code>${col}</code></td>${cells}</tr>`;
+    }).join("\n");
+    return `<!doctype html><html><head><meta charset="utf-8"><style>
+body{font:13px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;margin:8px;color:#222}
+table{border-collapse:collapse;width:100%}
+caption{text-align:left;font-weight:600;padding:4px 0 8px;font-size:14px}
+th,td{border:1px solid #ddd;padding:4px 8px;vertical-align:top;text-align:left}
+th{background:#f4f4f4}
+td:first-child{width:240px;white-space:nowrap;background:#fafafa}
+code{font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+</style></head><body>
+<table>
+  <caption>${escapeHtml(caption)}</caption>
+  <thead><tr><th>Column</th>${headerCells}</tr></thead>
+  <tbody>
+${bodyRows}
+  </tbody>
+</table>
+</body></html>`;
+}
+
+async function waitForCollectorExecutions(opts: {
+    emulatorOrderId: number;
+    tenant: string;
+    login: number;
+    minRows?: number;
+}): Promise<{ rows: CollectorExecutionRow[]; sql: string; polls: number }> {
+    const sql = buildCollectorExecutionSql(opts.emulatorOrderId, opts.tenant, opts.login);
+    const minRows = opts.minRows ?? 1;
+    const deadline = Date.now() + CH_POLL_TIMEOUT_MS;
+    let polls = 0;
+    while (Date.now() < deadline) {
+        polls++;
+        const rows = await chQuery<CollectorExecutionRow>(sql);
+        if (rows.length >= minRows) return {rows, sql, polls};
+        await new Promise((res) => setTimeout(res, CH_POLL_INTERVAL_MS));
+    }
+    throw new Error(
+        `collector.execution: <${minRows} row(s) for client_order_id='${opts.emulatorOrderId}' client_acc_id='${opts.login}' tenant_id='${opts.tenant}' ` +
         `after ${CH_POLL_TIMEOUT_MS}ms (polls=${polls})`,
     );
 }
@@ -866,7 +1011,7 @@ describe("MT5 | Market order BUY | parametrized by symbol", () => {
                             row,
                             `collector.order  (client_order_id='${emulatorOrderId}', client_acc_id='${login}', tenant_id='demo-uat')`,
                         )
-                        : `<!doctype html><html><body><p style="font:13px sans-serif"><strong>No row</strong> matched <code>client_order_id='${emulatorOrderId}' AND client_acc_id='${login}' AND tenant_id='demo-uat' AND is_completed=1</code>.</p><p style="font:13px sans-serif">Reason: ${escapeHtml(blockReason ?? "unknown")}</p></body></html>`,
+                        : `<!doctype html><html lang=""><body><p style="font:13px sans-serif"><strong>No row</strong> matched <code>client_order_id='${emulatorOrderId}' AND client_acc_id='${login}' AND tenant_id='demo-uat' AND is_completed=1</code>.</p><p style="font:13px sans-serif">Reason: ${escapeHtml(blockReason ?? "unknown")}</p></body></html>`,
                     "text/html",
                     "html",
                 );
@@ -876,6 +1021,218 @@ describe("MT5 | Market order BUY | parametrized by symbol", () => {
                 ]);
 
                 // 4. Final vitest assertion — fail loudly if blocked or scenario asserts fired.
+                if (blockReason) {
+                    expect.fail(blockReason);
+                }
+                expect(result.passed, JSON.stringify(result, null, 2)).toBe(true);
+            },
+            POLL_TIMEOUT_MS + CH_POLL_TIMEOUT_MS + 5_000,
+        );
+
+        it(
+            "Step 6 — ClickHouse collector.execution: ≥1 FILLED execution per order (ABOOK routing)",
+            async () => {
+                // Place + poll. Capture failure context without throwing early so
+                // every parametrized case is visible in the Allure report.
+                let blockReason: string | undefined;
+                let placeResp: PlaceOrderResponseBody | undefined;
+                let polled: Awaited<ReturnType<typeof pollUntilTerminal>> | undefined;
+                let execRows: CollectorExecutionRow[] = [];
+                let sql: string | undefined;
+                let chPolls = 0;
+
+                try {
+                    placeResp = await placeOrderRaw({symbol, volume, side, type: "MARKET", login});
+                } catch (e) {
+                    blockReason = `Step 2 (place) raw error: ${(e as Error).message}`;
+                }
+
+                if (!blockReason && placeResp!.code !== "OK") {
+                    blockReason =
+                        `Step 2: code=${placeResp!.code} message=${JSON.stringify(placeResp!.message)} ` +
+                        `(orderId=${placeResp!.orderId})`;
+                }
+
+                if (!blockReason && placeResp) {
+                    try {
+                        polled = await pollUntilTerminal(placeResp.orderId);
+                    } catch (e) {
+                        blockReason = `Step 3 (poll) error: ${(e as Error).message}`;
+                    }
+                }
+
+                const emulatorOrderId = placeResp?.orderId ?? 0;
+                sql = emulatorOrderId
+                    ? buildCollectorExecutionSql(emulatorOrderId, "demo-uat", login)
+                    : "-- order was not placed";
+
+                if (!blockReason && polled && polled.state !== "FILLED") {
+                    blockReason =
+                        `Step 4 precondition: order ${emulatorOrderId} state=${polled.state} ` +
+                        `comment=${JSON.stringify(polled.lastBody.comment ?? "")} — Step 6 cannot validate executions`;
+                }
+
+                if (!blockReason) {
+                    try {
+                        const r = await waitForCollectorExecutions({
+                            emulatorOrderId,
+                            tenant: "demo-uat",
+                            login,
+                        });
+                        execRows = r.rows;
+                        sql = r.sql;
+                        chPolls = r.polls;
+                    } catch (e) {
+                        blockReason = `Step 6 CH wait: ${(e as Error).message}`;
+                    }
+                }
+
+                // Derived metrics for assertions.
+                const filledRows = execRows.filter((r) => r.execution_type === "FILLED");
+                const sumFilledVolume = filledRows.reduce(
+                    (acc, r) => acc + (r.client_amount_filled ?? 0),
+                    0,
+                );
+
+                // Anchor an Allure entry via a ClickHouse client scenario so the step
+                // labels read "Request queryCollectorExecutions" / "Handle response …".
+                interface ExecutionApi {
+                    queryCollectorExecutions: {
+                        request: {
+                            method: "GET";
+                            path: string;
+                            headers?: { Authorization: string };
+                        };
+                        response: { code: 200; body: unknown };
+                    };
+                }
+
+                const chClient = new Client("clickhouse-collector", {
+                    protocol: new HttpProtocol<ExecutionApi>(),
+                    targetAddress: {host: "clickhouse.test-stable.cbrid.ge", port: 8123},
+                });
+                const scenario = new TestScenario({
+                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 6`,
+                    components: [chClient],
+                    recording: false,
+                });
+                scenario.addReporter(
+                    new AllureReporter({
+                        resultsDir: "allure-results",
+                        environmentInfo: {
+                            env: "demo-uat / test-stable",
+                            collector: "clickhouse.test-stable.cbrid.ge:8123 (collector.execution)",
+                            symbol,
+                            login: String(login),
+                            volume: String(volume),
+                            side,
+                            emulatorOrderId: String(emulatorOrderId),
+                            terminalState: polled?.state ?? "—",
+                            executions: String(execRows.length),
+                            filledExecutions: String(filledRows.length),
+                            sumFilledVolume: String(sumFilledVolume),
+                            routing: filledRows[0]?.routing ?? "—",
+                            chPolls: String(chPolls),
+                            blocked: blockReason ?? "—",
+                            node: process.version,
+                        },
+                    }),
+                );
+
+                const tcName = execRows.length
+                    ? `chExecutions ${symbol} ${side} login=${login} emulatorOrderId=${emulatorOrderId} (${execRows.length} row${execRows.length === 1 ? "" : "s"})`
+                    : `chExecutions ${symbol} ${side} login=${login} emulatorOrderId=${emulatorOrderId} — BLOCKED`;
+
+                const tc = testCase(tcName, (test) => {
+                    const ch = test.use(chClient);
+                    // Re-run the same SELECT for an Allure-recorded HTTP step.
+                    ch.request("queryCollectorExecutions", {
+                        method: "GET",
+                        path: `/?query=${encodeURIComponent(sql + " FORMAT JSONEachRow")}`,
+                        headers: {Authorization: CH_AUTH},
+                    });
+                    ch.onResponse("queryCollectorExecutions")
+                        .assert("HTTP 200", (res) => res.code === 200)
+                        .assert("≥1 execution row", () => execRows.length >= 1)
+                        .assert("≥1 FILLED execution", () => filledRows.length >= 1)
+                        .assert(
+                            "all rows tenant_id = demo-uat",
+                            () => execRows.every((r) => r.tenant_id === "demo-uat"),
+                        )
+                        .assert(
+                            "all rows client_order_id matches",
+                            () => execRows.every((r) => r.client_order_id === String(emulatorOrderId)),
+                        )
+                        .assert(
+                            "all rows client_acc_id matches",
+                            () => execRows.every((r) => r.client_acc_id === String(login)),
+                        )
+                        .assert(
+                            "all rows client_symbol_name matches",
+                            () => execRows.every((r) => r.client_symbol_name === symbol),
+                        )
+                        .assert("all rows side matches", () => execRows.every((r) => r.side === side))
+                        .assert(
+                            "all rows server_type = MT5",
+                            () => execRows.every((r) => r.server_type === "MT5"),
+                        )
+                        .assert(
+                            "all FILLED rows routing = ABOOK",
+                            () => filledRows.every((r) => r.routing === "ABOOK"),
+                        )
+                        .assert(
+                            "all FILLED rows lp_request_at NOT NULL",
+                            () => filledRows.every((r) => r.lp_request_at !== null),
+                        )
+                        .assert(
+                            "all FILLED rows lp_executed_at NOT NULL",
+                            () => filledRows.every((r) => r.lp_executed_at !== null),
+                        )
+                        .assert(
+                            "all FILLED rows lp_response_at NOT NULL",
+                            () => filledRows.every((r) => r.lp_response_at !== null),
+                        )
+                        .assert(
+                            "all FILLED rows client_price_filled > 0",
+                            () => filledRows.every((r) => (r.client_price_filled ?? 0) > 0),
+                        )
+                        .assert(
+                            "SUM(client_amount_filled WHERE FILLED) > 0",
+                            () => sumFilledVolume > 0,
+                        );
+                });
+
+                const result = await scenario.run(tc);
+                attachInteractionsToLatestAllureResult("allure-results", result.interactions ?? []);
+
+                // Attach SQL to the "request" step, execution-rows HTML table to the
+                // "onResponse" step.
+                const sqlAttachment = writeTextAttachment(
+                    "allure-results",
+                    "ClickHouse SELECT",
+                    sql,
+                    "text/plain",
+                    "txt",
+                );
+                const tableAttachment = writeTextAttachment(
+                    "allure-results",
+                    execRows.length
+                        ? `collector.execution — ${execRows.length} row${execRows.length === 1 ? "" : "s"}`
+                        : "collector.execution — no matching rows",
+                    execRows.length
+                        ? renderExecutionsAsHtmlTable(
+                            execRows,
+                            `collector.execution  (client_order_id='${emulatorOrderId}', client_acc_id='${login}', tenant_id='demo-uat')`,
+                        )
+                        : `<!doctype html><html><body><p style="font:13px sans-serif"><strong>No rows</strong> matched <code>client_order_id='${emulatorOrderId}' AND client_acc_id='${login}' AND tenant_id='demo-uat'</code>.</p><p style="font:13px sans-serif">Reason: ${escapeHtml(blockReason ?? "unknown")}</p></body></html>`,
+                    "text/html",
+                    "html",
+                );
+                attachExtrasToLatestAllureResult("allure-results", [
+                    {attachment: sqlAttachment, stepNameIncludes: "Request queryCollectorExecutions"},
+                    {attachment: tableAttachment, stepNameIncludes: "Handle response for queryCollectorExecutions"},
+                ]);
+
                 if (blockReason) {
                     expect.fail(blockReason);
                 }
