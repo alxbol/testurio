@@ -654,7 +654,7 @@ function consumeKafkaTail(opts: {
         );
         lines.push(`echo "===END_PARTITION=${po.partition}==="`);
     }
-    let rawOutput = "";
+    let rawOutput: string;
     try {
         rawOutput = kafkaExec(lines.join("\n"), Math.ceil((opts.timeoutMs * opts.fromOffsets.length) / 1000) + 15);
     } catch (e) {
@@ -709,7 +709,7 @@ function renderKafkaSummaryHtml(opts: {
         .slice(0, 50)
         .map((l) => escapeHtml(l))
         .join("\n");
-    return `<!doctype html><html><head><meta charset="utf-8"><style>
+    return `<!doctype html><html lang=""><head><meta charset="utf-8"><style>
 body{font:13px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;margin:8px;color:#222}
 table{border-collapse:collapse;margin-bottom:12px}
 caption{text-align:left;font-weight:600;padding:4px 0 8px;font-size:14px}
