@@ -4,9 +4,15 @@
  * Параметризация по символам: EURUSD.MT5, GBPUSD.MT5, XAUUSD.MT5, NZDUSD.MT5.
  *
  * Реализовано:
- *   Step 1 — Health check (GET /v1/health/ping).
- *   Step 2 — Place market BUY order (POST /v1/orders) с захватом orderId,
- *            валидация по Zod-схеме из OpenAPI + семантическая проверка code === "OK".
+ *   Step 1 — Health check (GET /v1/health/ping), один раз в beforeAll.
+ *   Step 2 — Place market BUY order (POST /v1/orders), code === "OK" + orderId > 0.
+ *   Step 3 — Wait for terminal state: poll GET /v1/orders/{id} 500ms × 15s до
+ *            state ∈ {FILLED, CANCELLED}; на этом шаге не утверждаем FILLED,
+ *            только что terminal-state достигнут.
+ *   Step 4 — Assert terminal outcome: строгая проверка final-body
+ *            (state=FILLED, symbol/side/type/volume/id matches). При CANCELLED —
+ *            извлекаем comment и формируем диагностический фейл (Not enough funds → P3,
+ *            "No price"/"Price off" → P5, прочее → escalate).
  *
  * Known spec discrepancy (defect candidate):
  *   OpenAPI declares the path as `GET /v1/ping`, but the live MT5 emulator
@@ -228,12 +234,12 @@ interface SymbolCase {
     side: "BUY" | "SELL";
 }
 
-const SYMBOL_CASES: SymbolCase[] = [
-    {symbol: "EURUSD.MT5", tcCode: "EURUSD", login: 123468, volume: 0.01, side: "BUY"},
-    {symbol: "GBPUSD.MT5", tcCode: "GBPUSD", login: 123468, volume: 0.01, side: "BUY"},
-    {symbol: "XAUUSD.MT5", tcCode: "XAUUSD", login: 123468, volume: 0.01, side: "BUY"},
-    {symbol: "NZDUSD.MT5", tcCode: "NZDUSD", login: 123468, volume: 0.01, side: "BUY"},
-];
+const SYMBOL_CASES: SymbolCase[] = (["BUY", "SELL"] as const).flatMap((side) => [
+    {symbol: "EURUSD.MT5", tcCode: "EURUSD", login: 123468, volume: 0.01, side},
+    {symbol: "GBPUSD.MT5", tcCode: "GBPUSD", login: 123468, volume: 0.01, side},
+    {symbol: "XAUUSD.MT5", tcCode: "XAUUSD", login: 123468, volume: 0.01, side},
+    {symbol: "NZDUSD.MT5", tcCode: "NZDUSD", login: 123468, volume: 0.01, side},
+]);
 
 // ---------------------------------------------------------------------------
 // Step 1 — Health check (один раз перед всеми Step 2 прогонами).
@@ -357,7 +363,7 @@ describe("MT5 | Market order BUY | parametrized by symbol", () => {
         });
 
         it(
-            "Step 3 — poll until terminal state: GET /v1/orders/{id} reaches FILLED within 15s (schema-validated)",
+            "Step 3 — poll until terminal state: GET /v1/orders/{id} reaches FILLED|CANCELLED within 15s (schema-validated)",
             async () => {
                 // 1. Place a fresh order via raw HTTP so we own the orderId imperatively.
                 const placed = await placeOrderRaw({symbol, volume, side, type: "MARKET", login});
@@ -400,7 +406,82 @@ describe("MT5 | Market order BUY | parametrized by symbol", () => {
                 );
 
                 const tc = testCase(
-                    `getOrder ${symbol} ${side} ${volume} login=${login} orderId=${orderId}`,
+                    `pollOrder ${symbol} ${side} ${volume} login=${login} orderId=${orderId}`,
+                    (test) => {
+                        const mt = test.use(mtClient);
+                        mt.request("getOrder", {method: "GET", path: `/v1/orders/${orderId}`});
+                        mt.onResponse("getOrder")
+                            .validate(GetOrderResponseSchema)
+                            .assert("HTTP 200", (res) => res.code === 200)
+                            .assert(
+                                "state ∈ {FILLED, CANCELLED}",
+                                (res) => res.body.state !== undefined && TERMINAL_STATES.has(res.body.state),
+                            );
+                    },
+                );
+
+                const result = await scenario.run(tc);
+                attachInteractionsToLatestAllureResult("allure-results", result.interactions ?? []);
+
+                expect(result.passed, JSON.stringify(result, null, 2)).toBe(true);
+                expect(TERMINAL_STATES.has(polled.state), `non-terminal state ${polled.state}`).toBe(true);
+            },
+            POLL_TIMEOUT_MS + 5_000,
+        );
+
+        it(
+            "Step 4 — assert terminal outcome: final body matches placed order (state=FILLED, all fields)",
+            async () => {
+                // 1. Place + 2. Poll (Step 2+3 preconditions).
+                const placed = await placeOrderRaw({symbol, volume, side, type: "MARKET", login});
+                expect(placed.code, JSON.stringify(placed)).toBe("OK");
+                const orderId = placed.orderId;
+                const polled = await pollUntilTerminal(orderId);
+
+                // 3. Diagnostic mapping per spec: CANCELLED → surface comment with
+                //    precondition hint (Not enough funds → P3, "No price"/"Price off" → P5).
+                if (polled.state === "CANCELLED") {
+                    const c = polled.lastBody.comment ?? "";
+                    let hint = "escalate with raw response";
+                    if (/not enough funds/i.test(c)) hint = "P3 broken (account underfunded for current price × volume)";
+                    else if (/no price|price off/i.test(c)) hint = "P5 broken (no ticks for the symbol)";
+                    throw new Error(
+                        `Step 4 failed: order ${orderId} (${symbol}) state=CANCELLED, comment=${JSON.stringify(c)} — ${hint}`,
+                    );
+                }
+
+                // 4. Strict assert of final body per Step 4 spec.
+                const mtClient = new Client("mt5-emulator", {
+                    protocol: new HttpProtocol<MtEmulatorApi>(),
+                    targetAddress: {host: "192.168.8.46", port: 5001},
+                });
+
+                const scenario = new TestScenario({
+                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 4`,
+                    components: [mtClient],
+                    recording: true,
+                });
+
+                scenario.addReporter(
+                    new AllureReporter({
+                        resultsDir: "allure-results",
+                        environmentInfo: {
+                            env: "demo-uat / test-stable",
+                            target: "192.168.8.46:5001 (MT Test emulator)",
+                            symbol,
+                            login: String(login),
+                            volume: String(volume),
+                            side,
+                            orderId: String(orderId),
+                            polls: String(polled.polls),
+                            terminalState: polled.state,
+                            node: process.version,
+                        },
+                    }),
+                );
+
+                const tc = testCase(
+                    `assertOrder ${symbol} ${side} ${volume} login=${login} orderId=${orderId}`,
                     (test) => {
                         const mt = test.use(mtClient);
                         mt.request("getOrder", {method: "GET", path: `/v1/orders/${orderId}`});
@@ -413,6 +494,8 @@ describe("MT5 | Market order BUY | parametrized by symbol", () => {
                             .assert("type === 'MARKET'", (res) => res.body.type === "MARKET")
                             .assert("volume matches", (res) => res.body.volume === volume)
                             .assert("id matches orderId", (res) => res.body.id === orderId);
+                        // filledVolume intentionally NOT strictly asserted: see spec note —
+                        // emulator may report filledVolume=0 right after state flips to FILLED.
                     },
                 );
 
@@ -420,7 +503,6 @@ describe("MT5 | Market order BUY | parametrized by symbol", () => {
                 attachInteractionsToLatestAllureResult("allure-results", result.interactions ?? []);
 
                 expect(result.passed, JSON.stringify(result, null, 2)).toBe(true);
-                expect(polled.state).toBe("FILLED");
             },
             POLL_TIMEOUT_MS + 5_000,
         );
