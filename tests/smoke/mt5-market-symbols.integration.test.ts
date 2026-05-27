@@ -24,6 +24,13 @@
  *            tenant_id, lp_request_at/lp_executed_at/lp_response_at NOT NULL,
  *            SUM(client_amount_filled WHERE FILLED) > 0. Schema-замена: `type=FILL` из
  *            спеки → `execution_type=FILLED`, `filled_volume` → `client_amount_filled`.
+ *   Step 7 — Kafka events: order.received.v1.demo-uat и order.finished.v1.demo-uat
+ *            должны опубликовать сообщение про наш orderId. Messages are protobuf-encoded
+ *            (not JSON as spec suggested) — we don't decode the payload; instead we capture
+ *            HWMs per partition before placing the order, then consume only the new tail
+ *            after FILLED and grep for the integer client_order_id as a literal byte
+ *            sequence in the message body. Topic naming and protobuf encoding are
+ *            adjustments vs spec ("KafkaGWEventsTopic"/"KafkaWHTopic" / JSON).
  *
  * Known spec discrepancy (defect candidate):
  *   OpenAPI declares the path as `GET /v1/ping`, but the live MT5 emulator
@@ -34,10 +41,12 @@ import {readdirSync, readFileSync, statSync, writeFileSync} from "node:fs";
 import {randomUUID} from "node:crypto";
 import {join} from "node:path";
 import {z} from "zod";
-import {Client, HttpProtocol, type Interaction, testCase, TestScenario} from "testurio";
+import {Client, DataSource, HttpProtocol, type Interaction, testCase, TestScenario} from "testurio";
+import {ClickHouseAdapter} from "@testurio/adapter-clickhouse";
 import {AllureReporter} from "@testurio/reporter-allure";
 import {beforeAll, describe, expect, it} from "vitest";
 import {GetV1PingResponse, PostV1OrdersResponse} from "./mt-api.schema";
+import {spawnSync} from "node:child_process";
 
 type AllureAttachment = { name: string; source: string; type: string };
 type AllureStep = { name: string; attachments?: AllureAttachment[]; steps?: AllureStep[] };
@@ -245,10 +254,23 @@ async function placeOrderRaw(body: PlaceOrderRequestBody): Promise<PlaceOrderRes
 // ClickHouse collector.order (Step 5)
 // ---------------------------------------------------------------------------
 
-const CH_BASE = "http://clickhouse.test-stable.cbrid.ge:8123";
-const CH_AUTH = "Basic " + Buffer.from("admin:admin").toString("base64");
+const CH_URL = "http://clickhouse.test-stable.cbrid.ge:8123";
+const CH_USER = "admin";
+const CH_PASS = "admin";
+const CH_DB = "default";
 const CH_POLL_TIMEOUT_MS = 30_000;
 const CH_POLL_INTERVAL_MS = 1_000;
+
+function makeClickHouseDataSource(name = "clickhouse-collector") {
+    return new DataSource(name, {
+        adapter: new ClickHouseAdapter({
+            url: CH_URL,
+            username: CH_USER,
+            password: CH_PASS,
+            database: CH_DB,
+        }),
+    });
+}
 
 interface CollectorOrderRow {
     collector_order_id: string;
@@ -537,6 +559,176 @@ async function waitForCollectorExecutions(opts: {
         `collector.execution: <${minRows} row(s) for client_order_id='${opts.emulatorOrderId}' client_acc_id='${opts.login}' tenant_id='${opts.tenant}' ` +
         `after ${CH_POLL_TIMEOUT_MS}ms (polls=${polls})`,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Kafka via `kubectl exec` into kafka-controller-0 (Step 7).
+// Bootstrap kafka:9092 is k8s-internal; we shell out to bitnami kafka tools
+// inside the pod instead of routing traffic through port-forward.
+// ---------------------------------------------------------------------------
+
+const KAFKA_KUBECTL = "C:/Users/abolshakov/bin/kubectl";
+const KAFKA_KUBECONFIG = "C:/Users/abolshakov/Documents/k8s/kubeconfig";
+const KAFKA_NS = "test-stable";
+const KAFKA_POD = "kafka-controller-0";
+const KAFKA_BOOTSTRAP = "kafka:9092";
+const KAFKA_BIN = "/opt/bitnami/kafka/bin";
+
+const KAFKA_TOPIC_RECEIVED = "order.received.v1.demo-uat";
+const KAFKA_TOPIC_FINISHED = "order.finished.v1.demo-uat";
+const KAFKA_LAG_MS = 3_000;
+const KAFKA_CONSUME_TIMEOUT_MS = 8_000;
+
+interface PartitionOffset {
+    partition: number;
+    offset: number;
+}
+
+function kafkaExec(bashScript: string, timeoutSec = 30): string {
+    // Use spawnSync (no shell) — kubectl is launched directly with argv to avoid
+    // Windows shell-quoting issues. Pass the bash script via stdin to bash inside
+    // the pod so we don't have to escape it in argv.
+    const r = spawnSync(
+        KAFKA_KUBECTL,
+        [
+            `--kubeconfig=${KAFKA_KUBECONFIG}`,
+            "-n",
+            KAFKA_NS,
+            "exec",
+            "-i",
+            KAFKA_POD,
+            "-c",
+            "kafka",
+            "--",
+            "bash",
+            "-s",
+        ],
+        {
+            input: bashScript,
+            encoding: "utf8",
+            timeout: timeoutSec * 1000,
+            maxBuffer: 16 * 1024 * 1024,
+        },
+    );
+    if (r.error) throw r.error;
+    if (r.status !== 0) {
+        throw new Error(`kubectl exec exited ${r.status}: ${r.stderr || r.stdout}`);
+    }
+    return r.stdout ?? "";
+}
+
+function getKafkaHwms(topic: string): PartitionOffset[] {
+    const out = kafkaExec(
+        `${KAFKA_BIN}/kafka-get-offsets.sh --bootstrap-server ${KAFKA_BOOTSTRAP} --topic ${topic} --time -1 2>/dev/null`,
+    );
+    return out
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+            // Format: <topic>:<partition>:<offset>
+            const [, p, o] = line.split(":");
+            return {partition: Number(p), offset: Number(o)};
+        })
+        .sort((a, b) => a.partition - b.partition);
+}
+
+function consumeKafkaTail(opts: {
+    topic: string;
+    fromOffsets: PartitionOffset[];
+    maxMessagesPerPartition: number;
+    timeoutMs: number;
+}): { rawOutput: string; perPartition: { partition: number; from: number; messageCount: number }[] } {
+    const lines: string[] = [];
+    for (const po of opts.fromOffsets) {
+        lines.push(`echo "===PARTITION=${po.partition} FROM=${po.offset}==="`);
+        lines.push(
+            `${KAFKA_BIN}/kafka-console-consumer.sh ` +
+            `--bootstrap-server ${KAFKA_BOOTSTRAP} ` +
+            `--topic ${opts.topic} ` +
+            `--partition ${po.partition} ` +
+            `--offset ${po.offset} ` +
+            `--max-messages ${opts.maxMessagesPerPartition} ` +
+            `--timeout-ms ${opts.timeoutMs} ` +
+            `2>/dev/null || true`,
+        );
+        lines.push(`echo "===END_PARTITION=${po.partition}==="`);
+    }
+    let rawOutput = "";
+    try {
+        rawOutput = kafkaExec(lines.join("\n"), Math.ceil((opts.timeoutMs * opts.fromOffsets.length) / 1000) + 15);
+    } catch (e) {
+        rawOutput = (e as { stdout?: string }).stdout ?? "";
+    }
+    const perPartition: { partition: number; from: number; messageCount: number }[] = [];
+    const partitionBlocks = rawOutput.split(/===PARTITION=(\d+) FROM=(\d+)===/g);
+    // split gives: [pre, p, from, body, p, from, body, ...]
+    for (let i = 1; i + 2 < partitionBlocks.length; i += 3) {
+        const p = Number(partitionBlocks[i]);
+        const from = Number(partitionBlocks[i + 1]);
+        const body = partitionBlocks[i + 2].split(`===END_PARTITION=${p}===`)[0] ?? "";
+        // Each kafka-console-consumer message is on its own line (or multiple).
+        // Use the "Processed a total of N messages" hint emitted to stderr (we suppressed) —
+        // fallback: count non-empty lines as a rough proxy.
+        const messageCount = body.split("\n").filter((l) => l.trim().length > 0).length;
+        perPartition.push({partition: p, from, messageCount});
+    }
+    return {rawOutput, perPartition};
+}
+
+function buildConsumerCommand(topic: string, fromOffsets: PartitionOffset[], maxPerPartition: number, timeoutMs: number): string {
+    return fromOffsets
+        .map(
+            (po) =>
+                `${KAFKA_BIN}/kafka-console-consumer.sh \\\n` +
+                `  --bootstrap-server ${KAFKA_BOOTSTRAP} \\\n` +
+                `  --topic ${topic} \\\n` +
+                `  --partition ${po.partition} \\\n` +
+                `  --offset ${po.offset} \\\n` +
+                `  --max-messages ${maxPerPartition} \\\n` +
+                `  --timeout-ms ${timeoutMs}`,
+        )
+        .join("\n\n");
+}
+
+function renderKafkaSummaryHtml(opts: {
+    topic: string;
+    hwmsBefore: PartitionOffset[];
+    hwmsAfter: PartitionOffset[];
+    matchedCount: number;
+    rawSnippetLines: string[];
+}): string {
+    const partRows = opts.hwmsBefore
+        .map((b) => {
+            const a = opts.hwmsAfter.find((x) => x.partition === b.partition);
+            const newMsgs = (a?.offset ?? b.offset) - b.offset;
+            return `    <tr><td>${b.partition}</td><td>${b.offset}</td><td>${a?.offset ?? "—"}</td><td>${newMsgs}</td></tr>`;
+        })
+        .join("\n");
+    const snippet = opts.rawSnippetLines
+        .slice(0, 50)
+        .map((l) => escapeHtml(l))
+        .join("\n");
+    return `<!doctype html><html><head><meta charset="utf-8"><style>
+body{font:13px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;margin:8px;color:#222}
+table{border-collapse:collapse;margin-bottom:12px}
+caption{text-align:left;font-weight:600;padding:4px 0 8px;font-size:14px}
+th,td{border:1px solid #ddd;padding:4px 8px;text-align:left}
+th{background:#f4f4f4}
+pre{font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#fafafa;border:1px solid #ddd;padding:8px;white-space:pre-wrap;word-break:break-word;max-height:480px;overflow:auto}
+.match{font-weight:600;color:${opts.matchedCount > 0 ? "#0a7" : "#c33"}}
+</style></head><body>
+<table>
+  <caption>${escapeHtml(opts.topic)} — partition tail</caption>
+  <thead><tr><th>partition</th><th>HWM before place</th><th>HWM after fill</th><th>new messages</th></tr></thead>
+  <tbody>
+${partRows}
+  </tbody>
+</table>
+<p>Messages whose payload contains <code>client_order_id</code> literal: <span class="match">${opts.matchedCount}</span></p>
+<p><em>Payload is protobuf — raw bytes shown below for context only (printable characters survive, binary is mangled). Field validation is delegated to Steps 5 &amp; 6 (collector.order / collector.execution rows).</em></p>
+<pre>${snippet || "&lt;no new messages&gt;"}</pre>
+</body></html>`;
 }
 
 async function pollUntilTerminal(orderId: number): Promise<{
@@ -1239,6 +1431,222 @@ describe("MT5 | Market order BUY | parametrized by symbol", () => {
                 expect(result.passed, JSON.stringify(result, null, 2)).toBe(true);
             },
             POLL_TIMEOUT_MS + CH_POLL_TIMEOUT_MS + 5_000,
+        );
+
+        it(
+            "Step 7 — Kafka: order.received + order.finished publish a message for our orderId",
+            async () => {
+                let blockReason: string | undefined;
+                let placeResp: PlaceOrderResponseBody | undefined;
+                let polled: Awaited<ReturnType<typeof pollUntilTerminal>> | undefined;
+
+                // 1. Snapshot HWMs BEFORE placing so we only consume our own tail.
+                let hwmsReceivedBefore: PartitionOffset[] = [];
+                let hwmsFinishedBefore: PartitionOffset[] = [];
+                try {
+                    hwmsReceivedBefore = getKafkaHwms(KAFKA_TOPIC_RECEIVED);
+                    hwmsFinishedBefore = getKafkaHwms(KAFKA_TOPIC_FINISHED);
+                } catch (e) {
+                    blockReason = `Step 7 kubectl/kafka HWM probe failed: ${(e as Error).message}`;
+                }
+
+                // 2. Place + poll (Step 2+3+4 preconditions).
+                if (!blockReason) {
+                    try {
+                        placeResp = await placeOrderRaw({symbol, volume, side, type: "MARKET", login});
+                    } catch (e) {
+                        blockReason = `Step 2 (place) raw error: ${(e as Error).message}`;
+                    }
+                }
+                if (!blockReason && placeResp!.code !== "OK") {
+                    blockReason =
+                        `Step 2: code=${placeResp!.code} message=${JSON.stringify(placeResp!.message)} ` +
+                        `(orderId=${placeResp!.orderId})`;
+                }
+                if (!blockReason && placeResp) {
+                    try {
+                        polled = await pollUntilTerminal(placeResp.orderId);
+                    } catch (e) {
+                        blockReason = `Step 3 (poll) error: ${(e as Error).message}`;
+                    }
+                }
+                if (!blockReason && polled && polled.state !== "FILLED") {
+                    blockReason =
+                        `Step 4 precondition: order ${placeResp!.orderId} state=${polled.state} ` +
+                        `comment=${JSON.stringify(polled.lastBody.comment ?? "")} — Step 7 expects FILLED to find Kafka events`;
+                }
+
+                const emulatorOrderId = placeResp?.orderId ?? 0;
+                const orderIdMarker = String(emulatorOrderId);
+
+                // 3. Allow bridge/kafka publishing lag, then consume the tail of each
+                //    topic from HWMs_before.
+                let receivedTail: ReturnType<typeof consumeKafkaTail> | undefined;
+                let finishedTail: ReturnType<typeof consumeKafkaTail> | undefined;
+                let hwmsReceivedAfter: PartitionOffset[] = hwmsReceivedBefore;
+                let hwmsFinishedAfter: PartitionOffset[] = hwmsFinishedBefore;
+                let receivedMatches = 0;
+                let finishedMatches = 0;
+
+                if (!blockReason && emulatorOrderId > 0) {
+                    await new Promise((res) => setTimeout(res, KAFKA_LAG_MS));
+                    try {
+                        hwmsReceivedAfter = getKafkaHwms(KAFKA_TOPIC_RECEIVED);
+                        hwmsFinishedAfter = getKafkaHwms(KAFKA_TOPIC_FINISHED);
+                        receivedTail = consumeKafkaTail({
+                            topic: KAFKA_TOPIC_RECEIVED,
+                            fromOffsets: hwmsReceivedBefore,
+                            maxMessagesPerPartition: 200,
+                            timeoutMs: KAFKA_CONSUME_TIMEOUT_MS,
+                        });
+                        finishedTail = consumeKafkaTail({
+                            topic: KAFKA_TOPIC_FINISHED,
+                            fromOffsets: hwmsFinishedBefore,
+                            maxMessagesPerPartition: 200,
+                            timeoutMs: KAFKA_CONSUME_TIMEOUT_MS,
+                        });
+                    } catch (e) {
+                        blockReason = `Step 7 Kafka consume error: ${(e as Error).message}`;
+                    }
+                }
+
+                // 4. Grep for our integer client_order_id as a literal byte sequence
+                //    inside the protobuf payload.
+                const orderIdRe = new RegExp(`(?:^|[^0-9])${orderIdMarker}(?:[^0-9]|$)`);
+                if (receivedTail) {
+                    receivedMatches = receivedTail.rawOutput
+                        .split("\n")
+                        .filter((l) => orderIdRe.test(l)).length;
+                }
+                if (finishedTail) {
+                    finishedMatches = finishedTail.rawOutput
+                        .split("\n")
+                        .filter((l) => orderIdRe.test(l)).length;
+                }
+
+                // 5. Synthetic Allure scenario so Step 7 shows up per parametrized case.
+                interface KafkaApi {
+                    queryKafkaTopics: {
+                        request: { method: "GET"; path: string };
+                        response: { code: 200; body: unknown };
+                    };
+                }
+
+                const mtClient = new Client("mt5-emulator", {
+                    protocol: new HttpProtocol<KafkaApi>(),
+                    targetAddress: {host: "192.168.8.46", port: 5001},
+                });
+                const scenario = new TestScenario({
+                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 7`,
+                    components: [mtClient],
+                    recording: false,
+                });
+                scenario.addReporter(
+                    new AllureReporter({
+                        resultsDir: "allure-results",
+                        environmentInfo: {
+                            env: "demo-uat / test-stable",
+                            kafka: `${KAFKA_BOOTSTRAP} (via kubectl exec ${KAFKA_POD})`,
+                            topicReceived: KAFKA_TOPIC_RECEIVED,
+                            topicFinished: KAFKA_TOPIC_FINISHED,
+                            symbol,
+                            login: String(login),
+                            volume: String(volume),
+                            side,
+                            emulatorOrderId: String(emulatorOrderId),
+                            terminalState: polled?.state ?? "—",
+                            receivedMatches: String(receivedMatches),
+                            finishedMatches: String(finishedMatches),
+                            blocked: blockReason ?? "—",
+                            node: process.version,
+                        },
+                    }),
+                );
+
+                const tcName = blockReason
+                    ? `kafkaOrderEvents ${symbol} ${side} login=${login} emulatorOrderId=${emulatorOrderId} — BLOCKED`
+                    : `kafkaOrderEvents ${symbol} ${side} login=${login} emulatorOrderId=${emulatorOrderId}`;
+
+                const tc = testCase(tcName, (test) => {
+                    const mt = test.use(mtClient);
+                    // Anchor request — health ping (cheap, real) so the testurio scenario
+                    // has a recorded interaction to hang assertions off of.
+                    mt.request("queryKafkaTopics", {method: "GET", path: "/v1/health/ping"});
+                    mt.onResponse("queryKafkaTopics")
+                        .assert(`order.received.v1.demo-uat contains client_order_id='${orderIdMarker}'`,
+                            () => receivedMatches >= 1)
+                        .assert(`order.finished.v1.demo-uat contains client_order_id='${orderIdMarker}'`,
+                            () => finishedMatches >= 1);
+                });
+
+                const result = await scenario.run(tc);
+
+                // 6. Attach consumer commands + summary HTML to the corresponding steps.
+                const receivedCmd = buildConsumerCommand(
+                    KAFKA_TOPIC_RECEIVED,
+                    hwmsReceivedBefore,
+                    200,
+                    KAFKA_CONSUME_TIMEOUT_MS,
+                );
+                const finishedCmd = buildConsumerCommand(
+                    KAFKA_TOPIC_FINISHED,
+                    hwmsFinishedBefore,
+                    200,
+                    KAFKA_CONSUME_TIMEOUT_MS,
+                );
+                const combinedCommand =
+                    `# kubectl --kubeconfig=${KAFKA_KUBECONFIG} -n ${KAFKA_NS} exec -it ${KAFKA_POD} -- bash\n\n` +
+                    `# Topic 1: ${KAFKA_TOPIC_RECEIVED}\n${receivedCmd}\n\n` +
+                    `# Topic 2: ${KAFKA_TOPIC_FINISHED}\n${finishedCmd}\n`;
+
+                const matchedLinesReceived = receivedTail
+                    ? receivedTail.rawOutput.split("\n").filter((l) => orderIdRe.test(l))
+                    : [];
+                const matchedLinesFinished = finishedTail
+                    ? finishedTail.rawOutput.split("\n").filter((l) => orderIdRe.test(l))
+                    : [];
+
+                const cmdAttachment = writeTextAttachment(
+                    "allure-results",
+                    "Kafka consumer commands",
+                    combinedCommand,
+                    "text/plain",
+                    "txt",
+                );
+                const summaryAttachment = writeTextAttachment(
+                    "allure-results",
+                    "Kafka topics — message tail summary",
+                    [
+                        renderKafkaSummaryHtml({
+                            topic: KAFKA_TOPIC_RECEIVED,
+                            hwmsBefore: hwmsReceivedBefore,
+                            hwmsAfter: hwmsReceivedAfter,
+                            matchedCount: receivedMatches,
+                            rawSnippetLines: matchedLinesReceived,
+                        }),
+                        renderKafkaSummaryHtml({
+                            topic: KAFKA_TOPIC_FINISHED,
+                            hwmsBefore: hwmsFinishedBefore,
+                            hwmsAfter: hwmsFinishedAfter,
+                            matchedCount: finishedMatches,
+                            rawSnippetLines: matchedLinesFinished,
+                        }),
+                    ].join("\n<hr/>\n"),
+                    "text/html",
+                    "html",
+                );
+
+                attachExtrasToLatestAllureResult("allure-results", [
+                    {attachment: cmdAttachment, stepNameIncludes: "Request queryKafkaTopics"},
+                    {attachment: summaryAttachment, stepNameIncludes: "Handle response for queryKafkaTopics"},
+                ]);
+
+                if (blockReason) {
+                    expect.fail(blockReason);
+                }
+                expect(result.passed, JSON.stringify(result, null, 2)).toBe(true);
+            },
+            POLL_TIMEOUT_MS + 2 * KAFKA_CONSUME_TIMEOUT_MS + KAFKA_LAG_MS + 30_000,
         );
     });
 });
