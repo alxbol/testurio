@@ -467,7 +467,7 @@ ${bodyRows}
 }
 
 function wrapHtml(body: string): string {
-    return `<!doctype html><html><head><meta charset="utf-8"><style>
+    return `<!doctype html><html lang=""><head><meta charset="utf-8"><style>
 body{font:13px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;margin:8px;color:#222}
 table{border-collapse:collapse;width:100%}
 caption{text-align:left;font-weight:600;padding:4px 0 8px;font-size:14px}
