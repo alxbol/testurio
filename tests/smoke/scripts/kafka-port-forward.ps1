@@ -95,7 +95,7 @@ Write-Host " For the test, run in another shell:" -ForegroundColor Cyan
 if ($LocalPort -ne 9092) {
     Write-Host "   `$env:KAFKA_BROKERS='localhost:$LocalPort'" -ForegroundColor Gray
 }
-Write-Host "   npx vitest run tests/smoke/mt5-market-symbols-v2.integration.test.ts" -ForegroundColor Gray
+Write-Host "   npx vitest run tests/smoke/mt5-market-orders.test.ts" -ForegroundColor Gray
 Write-Host " Ctrl+C to stop." -ForegroundColor Cyan
 Write-Host "=========================================" -ForegroundColor Cyan
 Write-Host ""

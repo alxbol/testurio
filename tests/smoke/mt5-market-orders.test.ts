@@ -1,10 +1,8 @@
 /**
- * TC-MT5-MARKET-{SIDE}-{SYMBOL}-001 — clean rewrite of the parameterized
- * MT5 → bridge → fill happy path using canonical testurio adapters.
+ * TC-MT5-MARKET-{SIDE}-{SYMBOL}-001 — parameterized MT5 → bridge → fill
+ * happy path using canonical testurio adapters.
  *
- * Replaces the legacy `mt5-market-symbols.integration.test.ts` which used
- * raw `fetch` for HTTP/ClickHouse and `kubectl exec` for Kafka. This file
- * follows the official testurio examples verbatim:
+ * Follows the official testurio examples verbatim:
  *
  *   • HTTP (Steps 1–4)  — `Client` + `HttpProtocol<MtEmulatorApi>`
  *     https://udamir.github.io/testurio/examples/http.html

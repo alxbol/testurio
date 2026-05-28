@@ -45,7 +45,7 @@ cat <<EOF
 EOF
 [[ "$LOCAL_PORT" != "9092" ]] && echo "   export KAFKA_BROKERS=localhost:$LOCAL_PORT"
 cat <<EOF
-   npx vitest run tests/smoke/mt5-market-symbols-v2.integration.test.ts
+   npx vitest run tests/smoke/mt5-market-orders.test.ts
  Ctrl+C to stop.
 =========================================
 
