@@ -1,5 +1,5 @@
 /**
- * TC-MT5-MARKET-{SIDE}-{SYMBOL}-001 — parameterized MT5 → bridge → fill
+ * TC-MT4-MARKET-{SIDE}-{SYMBOL}-001 — parameterized MT4 → bridge → fill
  * happy path using canonical testurio adapters.
  *
  * Follows the official testurio examples verbatim:
@@ -23,8 +23,8 @@
  *   # then add to %WINDIR%/system32/drivers/etc/hosts:
  *   #   127.0.0.1 kafka-controller-0.kafka-controller-headless.test-stable.svc.cluster.local
  *
- * Symbol parametrization: EURUSD.MT5 / GBPUSD.MT5 / XAUUSD.MT5 / NZDUSD.MT5,
- * both BUY and SELL sides; login=123470 (memory: reference_demo_uat_traders).
+ * Symbol parametrization: AUDJPY.MT4 / GBPJPY.MT4 / CADJPY.MT4 / USDJPY.MT4,
+ * both BUY and SELL sides; login=1063 (memory: reference_demo_uat_traders).
  */
 
 import {randomUUID} from "node:crypto";
@@ -212,10 +212,10 @@ interface MtEmulatorApi {
 }
 
 const MT_HOST = "192.168.8.46";
-const MT_PORT = 5001;
+const MT_PORT = 5000;
 
 function makeMtClient() {
-    return new Client("mt5-emulator", {
+    return new Client("mt4-emulator", {
         protocol: new HttpProtocol<MtEmulatorApi>(),
         targetAddress: {host: MT_HOST, port: MT_PORT},
     });
@@ -508,7 +508,7 @@ function makeKafkaSubscriber(groupId?: string) {
     return new Subscriber<OrderEventTopics>("kafka-order-events-sub", {
         adapter: new KafkaAdapter({
             brokers: KAFKA_BROKERS,
-            groupId: groupId ?? `mt5-smoke-${randomUUID()}`,
+            groupId: groupId ?? `mt4-smoke-${randomUUID()}`,
             // testMode tightens KafkaJS consumer-group coordination for faster rebalancing.
             testMode: true,
         }),
@@ -589,27 +589,27 @@ interface SymbolCase {
 }
 
 const SYMBOL_CASES: SymbolCase[] = (["BUY", "SELL"] as const).flatMap((side) => [
-    {symbol: "EURUSD.MT5", tcCode: "EURUSD", login: 123470, volume: 0.01, side},
-    {symbol: "GBPUSD.MT5", tcCode: "GBPUSD", login: 123470, volume: 0.01, side},
-    {symbol: "XAUUSD.MT5", tcCode: "XAUUSD", login: 123470, volume: 0.01, side},
-    {symbol: "NZDUSD.MT5", tcCode: "NZDUSD", login: 123470, volume: 0.01, side},
+    {symbol: "AUDJPY.MT4", tcCode: "AUDJPY", login: 1063, volume: 0.01, side},
+    {symbol: "GBPJPY.MT4", tcCode: "GBPJPY", login: 1063, volume: 0.01, side},
+    {symbol: "CADJPY.MT4", tcCode: "CADJPY", login: 1063, volume: 0.01, side},
+    {symbol: "USDJPY.MT4", tcCode: "USDJPY", login: 1063, volume: 0.01, side},
 ]);
 
 const TENANT = "demo-uat";
-const ALLURE_PARENT_SUITE = "MT5 | Market order BUY/SELL | parametrized by symbol";
+const ALLURE_PARENT_SUITE = "MT4 | Market order BUY/SELL | parametrized by symbol";
 const allureSuiteFor = (s: SymbolCase) =>
-    `MT5 | Market order '${s.side}' | '${s.symbol}' ${s.volume} | login ${s.login}`;
+    `MT4 | Market order '${s.side}' | '${s.symbol}' ${s.volume} | login ${s.login}`;
 
 // ---------------------------------------------------------------------------
 // Suite.
 // ---------------------------------------------------------------------------
 
-describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
+describe("MT4 | Market order BUY/SELL | parametrized by symbol", () => {
     beforeAll(async () => {
         // Step 1 — Health check via canonical Client + HttpProtocol.
         const mtClient = makeMtClient();
         const scenario = new TestScenario({
-            name: "TC-MT5-MARKET / Step 1 (shared health check)",
+            name: "TC-MT4-MARKET / Step 1 (shared health check)",
             components: [mtClient],
             recording: true,
         });
@@ -643,7 +643,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
     });
 
     describe.each(SYMBOL_CASES)(
-        "MT5 | Market order $side | $symbol $volume | login $login",
+        "MT4 | Market order $side | $symbol $volume | login $login",
         ({symbol, tcCode, login, volume, side}) => {
             const ALLURE_SUITE = allureSuiteFor({symbol, tcCode, login, volume, side});
             const labelSuites = () =>
@@ -655,7 +655,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
             it(`Step 2 — place market ${side}: POST /v1/orders → 200 {code:'OK', orderId>0}`, async () => {
                 const mtClient = makeMtClient();
                 const scenario = new TestScenario({
-                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 2`,
+                    name: `TC-MT4-MARKET-${side}-${tcCode}-001 / Step 2`,
                     components: [mtClient],
                     recording: true,
                 });
@@ -710,7 +710,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
             }> => {
                 const mtClient = makeMtClient();
                 const scenario = new TestScenario({
-                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / ${stepLabel} place leg`,
+                    name: `TC-MT4-MARKET-${side}-${tcCode}-001 / ${stepLabel} place leg`,
                     components: [mtClient],
                     recording: true,
                 });
@@ -753,7 +753,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
 
                 const mtClient = makeMtClient();
                 const scenario = new TestScenario({
-                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 3`,
+                    name: `TC-MT4-MARKET-${side}-${tcCode}-001 / Step 3`,
                     components: [mtClient],
                     recording: true,
                 });
@@ -815,7 +815,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
 
                 const mtClient = makeMtClient();
                 const scenario = new TestScenario({
-                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 4`,
+                    name: `TC-MT4-MARKET-${side}-${tcCode}-001 / Step 4`,
                     components: [mtClient],
                     recording: true,
                 });
@@ -900,7 +900,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
 
                 const ch = makeChDataSource();
                 const scenario = new TestScenario({
-                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 5`,
+                    name: `TC-MT4-MARKET-${side}-${tcCode}-001 / Step 5`,
                     components: [ch],
                     recording: false,
                 });
@@ -953,7 +953,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
                             .assert("bridge_status = FILLED", () => row?.bridge_status === "FILLED")
                             .assert("client_status = FILLED", () => row?.client_status === "FILLED")
                             .assert("lp_status = FILLED", () => row?.lp_status === "FILLED")
-                            .assert("server_type = MT5", () => row?.server_type === "MT5")
+                            .assert("server_type = MT4", () => row?.server_type === "MT4")
                             .assert("is_completed = 1", () => row?.is_completed === 1)
                             .assert("is_order_received = 1", () => row?.is_order_received === 1)
                             .assert("is_final_order_received = 1", () => row?.is_final_order_received === 1)
@@ -1028,7 +1028,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
 
                 const ch = makeChDataSource();
                 const scenario = new TestScenario({
-                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 6`,
+                    name: `TC-MT4-MARKET-${side}-${tcCode}-001 / Step 6`,
                     components: [ch],
                     recording: false,
                 });
@@ -1100,8 +1100,8 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
                             )
                             .assert("all rows side matches", () => execRows.every((r) => r.side === side))
                             .assert(
-                                "all rows server_type = MT5",
-                                () => execRows.every((r) => r.server_type === "MT5"),
+                                "all rows server_type = MT4",
+                                () => execRows.every((r) => r.server_type === "MT4"),
                             )
                             .assert(
                                 "all FILLED rows routing = ABOOK",
@@ -1182,11 +1182,11 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
                 // GROUP_JOIN, then place the order — guaranteeing capture.
                 const kafka = new Kafka({
                     brokers: KAFKA_BROKERS,
-                    clientId: `mt5-smoke-${randomUUID()}`,
+                    clientId: `mt4-smoke-${randomUUID()}`,
                     logLevel: kafkaLogLevel.NOTHING,
                 });
                 const consumer = kafka.consumer({
-                    groupId: `mt5-smoke-${randomUUID()}`,
+                    groupId: `mt4-smoke-${randomUUID()}`,
                     sessionTimeout: 10_000,
                     heartbeatInterval: 3_000,
                 });

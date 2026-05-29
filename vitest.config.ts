@@ -1,5 +1,5 @@
-import { defineConfig } from 'vitest/config';
-import { resolve } from 'node:path';
+import {defineConfig} from 'vitest/config';
+import {resolve} from 'node:path';
 
 export default defineConfig({
   test: {
@@ -9,7 +9,7 @@ export default defineConfig({
     exclude: ['node_modules'],
     testTimeout: 30000,
     hookTimeout: 60000,
-    globalSetup: ['./tests/global-setup.ts'],
+    globalSetup: ['./tests/global-setup.ts', './tests/smoke/kafka-tunnel.global-setup.ts'],
   },
   resolve: {
     alias: {
