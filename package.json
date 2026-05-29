@@ -42,6 +42,7 @@
     "@types/ws": "^8.18.1",
     "@vitest/coverage-v8": "^4.1.0",
     "ioredis": "^5.10.0",
+    "kafkajs": "^2.2.4",
     "testcontainers": "^11.12.0",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",

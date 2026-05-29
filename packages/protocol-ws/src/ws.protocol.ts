@@ -1,5 +1,5 @@
 /**
- * WebSocket Protocol (v2)
+ * WebSocket Protocol
  *
  * Implements async bidirectional messaging over WebSocket.
  *
@@ -21,9 +21,9 @@ import type {
 	SchemaDefinition,
 	ServerProtocolConfig,
 } from "testurio";
-import { BaseAsyncProtocol } from "testurio";
-import type { WsConnectParams, WsProtocolOptions, WsServiceDefinition } from "./types";
-import { WsClientAdapter, WsServerAdapter } from "./ws.adapters";
+import {BaseAsyncProtocol} from "testurio";
+import type {WsConnectParams, WsProtocolOptions, WsServiceDefinition} from "./types";
+import {WsClientAdapter, WsServerAdapter} from "./ws.adapters";
 
 /**
  * Resolve WebSocket protocol type from generic parameter.

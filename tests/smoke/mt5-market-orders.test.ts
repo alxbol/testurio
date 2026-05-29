@@ -24,7 +24,7 @@
  *   #   127.0.0.1 kafka-controller-0.kafka-controller-headless.test-stable.svc.cluster.local
  *
  * Symbol parametrization: EURUSD.MT5 / GBPUSD.MT5 / XAUUSD.MT5 / NZDUSD.MT5,
- * both BUY and SELL sides; login=123468 (memory: reference_demo_uat_traders).
+ * both BUY and SELL sides; login=123470 (memory: reference_demo_uat_traders).
  */
 
 import {randomUUID} from "node:crypto";
@@ -45,6 +45,7 @@ import {
 import {ClickHouseAdapter} from "@testurio/adapter-clickhouse";
 import {KafkaAdapter} from "@testurio/adapter-kafka";
 import {AllureReporter} from "@testurio/reporter-allure";
+import {Kafka, logLevel as kafkaLogLevel} from "kafkajs";
 import {beforeAll, describe, expect, it} from "vitest";
 import {GetV1PingResponse, PostV1OrdersResponse} from "./mt-api.schema";
 
@@ -586,14 +587,14 @@ interface SymbolCase {
 }
 
 const SYMBOL_CASES: SymbolCase[] = (["BUY", "SELL"] as const).flatMap((side) => [
-    {symbol: "EURUSD.MT5", tcCode: "EURUSD", login: 123468, volume: 0.01, side},
-    {symbol: "GBPUSD.MT5", tcCode: "GBPUSD", login: 123468, volume: 0.01, side},
-    {symbol: "XAUUSD.MT5", tcCode: "XAUUSD", login: 123468, volume: 0.01, side},
-    {symbol: "NZDUSD.MT5", tcCode: "NZDUSD", login: 123468, volume: 0.01, side},
+    {symbol: "EURUSD.MT5", tcCode: "EURUSD", login: 123470, volume: 0.01, side},
+    {symbol: "GBPUSD.MT5", tcCode: "GBPUSD", login: 123470, volume: 0.01, side},
+    {symbol: "XAUUSD.MT5", tcCode: "XAUUSD", login: 123470, volume: 0.01, side},
+    {symbol: "NZDUSD.MT5", tcCode: "NZDUSD", login: 123470, volume: 0.01, side},
 ]);
 
 const TENANT = "demo-uat";
-const ALLURE_PARENT_SUITE = "MT5 | Market order BUY/SELL | parametrized by symbol (v2)";
+const ALLURE_PARENT_SUITE = "MT5 | Market order BUY/SELL | parametrized by symbol";
 const allureSuiteFor = (s: SymbolCase) =>
     `MT5 | Market order '${s.side}' | '${s.symbol}' ${s.volume} | login ${s.login}`;
 
@@ -601,7 +602,7 @@ const allureSuiteFor = (s: SymbolCase) =>
 // Suite.
 // ---------------------------------------------------------------------------
 
-describe("MT5 | Market order BUY/SELL | parametrized by symbol (v2)", () => {
+describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
     beforeAll(async () => {
         // Step 1 — Health check via canonical Client + HttpProtocol.
         const mtClient = makeMtClient();
@@ -652,7 +653,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol (v2)", () => {
             it(`Step 2 — place market ${side}: POST /v1/orders → 200 {code:'OK', orderId>0}`, async () => {
                 const mtClient = makeMtClient();
                 const scenario = new TestScenario({
-                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 2 (v2)`,
+                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 2`,
                     components: [mtClient],
                     recording: true,
                 });
@@ -750,7 +751,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol (v2)", () => {
 
                 const mtClient = makeMtClient();
                 const scenario = new TestScenario({
-                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 3 (v2)`,
+                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 3`,
                     components: [mtClient],
                     recording: true,
                 });
@@ -812,7 +813,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol (v2)", () => {
 
                 const mtClient = makeMtClient();
                 const scenario = new TestScenario({
-                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 4 (v2)`,
+                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 4`,
                     components: [mtClient],
                     recording: true,
                 });
@@ -897,7 +898,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol (v2)", () => {
 
                 const ch = makeChDataSource();
                 const scenario = new TestScenario({
-                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 5 (v2)`,
+                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 5`,
                     components: [ch],
                     recording: false,
                 });
@@ -1025,7 +1026,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol (v2)", () => {
 
                 const ch = makeChDataSource();
                 const scenario = new TestScenario({
-                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 6 (v2)`,
+                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 6`,
                     components: [ch],
                     recording: false,
                 });
@@ -1162,11 +1163,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol (v2)", () => {
             // -----------------------------------------------------------------
             it(`Step 7 — Kafka: order.received + order.finished publish a message for our orderId`, async () => {
                 let blockReason: string | undefined;
-                let placeResp: PlaceOrderResponseBody | undefined;
-                let polled: Awaited<ReturnType<typeof pollUntilTerminal>> | undefined;
 
-                // Pre-flight: confirm port-forward is up so we fail fast with a
-                // clear hint instead of waiting 30 s for kafkajs to time out.
                 if (!(await isKafkaReachable(KAFKA_BROKERS))) {
                     blockReason =
                         `Kafka brokers ${KAFKA_BROKERS.join(",")} unreachable. ` +
@@ -1175,99 +1172,121 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol (v2)", () => {
                         `Override broker with KAFKA_BROKERS=<host:port> env var if needed.`;
                 }
 
+                // Raw kafkajs path: the testurio Subscriber lifecycle starts the
+                // consumer lazily AFTER `placeAndCaptureOrderId`, so bridge events
+                // published in the meantime land before the consumer joins and
+                // are missed (delay measured at -200 ms — message arrives before
+                // wait step starts). We open the consumer first, wait for the
+                // GROUP_JOIN, then place the order — guaranteeing capture.
+                const kafka = new Kafka({
+                    brokers: KAFKA_BROKERS,
+                    clientId: `mt5-smoke-${randomUUID()}`,
+                    logLevel: kafkaLogLevel.NOTHING,
+                });
+                const consumer = kafka.consumer({
+                    groupId: `mt5-smoke-${randomUUID()}`,
+                    sessionTimeout: 10_000,
+                    heartbeatInterval: 3_000,
+                });
+
+                const matched = {received: false, finished: false};
+                let resolveBoth: () => void = () => undefined;
+                const bothMatched = new Promise<void>((res) => {
+                    resolveBoth = res;
+                });
+
+                let emulatorOrderId = 0;
+                let orderIdMarker = "";
+                let polledState: string | undefined;
+
                 try {
-                    if (!blockReason) placeResp = (await placeAndCaptureOrderId("Step 7")).response;
-                } catch (e) {
-                    blockReason = `Step 2 (place) error: ${(e as Error).message}`;
-                }
-                if (!blockReason && placeResp!.code !== "OK") {
-                    blockReason = `Step 2: code=${placeResp!.code} message=${JSON.stringify(placeResp!.message)}`;
-                }
-                if (!blockReason && placeResp) {
+                    if (!blockReason) {
+                        await consumer.connect();
+                        await consumer.subscribe({topic: KAFKA_TOPIC_RECEIVED, fromBeginning: false});
+                        await consumer.subscribe({topic: KAFKA_TOPIC_FINISHED, fromBeginning: false});
+
+                        // Register GROUP_JOIN listener BEFORE consumer.run() —
+                        // kafkajs fires it as soon as the group rebalance
+                        // completes (often within 1-2 s), and a listener
+                        // attached afterwards races with the event.
+                        const joinedPromise = new Promise<void>((res, rej) => {
+                            const t = setTimeout(
+                                () => rej(new Error("kafkajs GROUP_JOIN timeout (15s)")),
+                                15_000,
+                            );
+                            consumer.on(consumer.events.GROUP_JOIN, () => {
+                                clearTimeout(t);
+                                res();
+                            });
+                        });
+
+                        await consumer.run({
+                            eachMessage: async ({topic, message}) => {
+                                const val = message.value;
+                                if (!val || !orderIdMarker) return;
+                                if (!bytesContainAscii(val as Uint8Array, orderIdMarker)) return;
+                                if (topic === KAFKA_TOPIC_RECEIVED) matched.received = true;
+                                if (topic === KAFKA_TOPIC_FINISHED) matched.finished = true;
+                                if (matched.received && matched.finished) resolveBoth();
+                            },
+                        });
+
+                        await joinedPromise;
+
+                        // Now safe to place the order.
+                        const placed = await placeAndCaptureOrderId("Step 7");
+                        const placeResp = placed.response;
+                        if (placeResp.code !== "OK") {
+                            blockReason = `Step 2: code=${placeResp.code} message=${JSON.stringify(placeResp.message)}`;
+                        } else {
+                            emulatorOrderId = placeResp.orderId;
+                            orderIdMarker = String(emulatorOrderId);
+                            const polled = await pollUntilTerminal(emulatorOrderId);
+                            polledState = polled.state;
+                            if (polled.state !== "FILLED") {
+                                blockReason =
+                                    `Step 4 precondition: order ${emulatorOrderId} state=${polled.state} ` +
+                                    `comment=${JSON.stringify(polled.lastBody.comment ?? "")}`;
+                            } else {
+                                // Race: messages may have arrived for prior orders before
+                                // orderIdMarker was set; eachMessage now starts matching.
+                                await Promise.race([
+                                    bothMatched,
+                                    new Promise<void>((res) => setTimeout(res, KAFKA_WAIT_MESSAGE_TIMEOUT_MS)),
+                                ]);
+                            }
+                        }
+                    }
+                } finally {
                     try {
-                        polled = await pollUntilTerminal(placeResp.orderId);
-                    } catch (e) {
-                        blockReason = `Step 3 (poll) error: ${(e as Error).message}`;
+                        await consumer.disconnect();
+                    } catch {
+                        // best-effort cleanup
                     }
                 }
-                const emulatorOrderId = placeResp?.orderId ?? 0;
-                const orderIdMarker = String(emulatorOrderId);
-                if (!blockReason && polled && polled.state !== "FILLED") {
-                    blockReason =
-                        `Step 4 precondition: order ${emulatorOrderId} state=${polled.state} ` +
-                        `comment=${JSON.stringify(polled.lastBody.comment ?? "")}`;
-                }
 
-                const sub = makeKafkaSubscriber();
-                const scenario = new TestScenario({
-                    name: `TC-MT5-MARKET-${side}-${tcCode}-001 / Step 7 (v2)`,
-                    // Subscribers before any publishers (per docs); here only `sub`.
-                    components: [sub],
-                    recording: false,
-                });
-                scenario.addReporter(
-                    new AllureReporter({
-                        resultsDir: ALLURE_DIR,
-                        environmentInfo: {
-                            env: "demo-uat / test-stable",
-                            kafka: KAFKA_BROKERS.join(","),
-                            topicReceived: KAFKA_TOPIC_RECEIVED,
-                            topicFinished: KAFKA_TOPIC_FINISHED,
-                            symbol,
-                            login: String(login),
-                            volume: String(volume),
-                            side,
-                            emulatorOrderId: orderIdMarker,
-                            terminalState: polled?.state ?? "—",
-                            blocked: blockReason ?? "—",
-                            node: process.version,
-                        },
-                    }),
-                );
-
-                const tc = testCase(
-                    `kafkaOrderEvents ${symbol} ${side} login=${login} emulatorOrderId=${emulatorOrderId}`,
-                    (test) => {
-                        if (blockReason) {
-                            // Anchor the scenario with a no-op so Allure records the case;
-                            // the precondition failure is surfaced by expect.fail below.
-                            return;
-                        }
-                        const s = test.use(sub);
-                        // Strict wait for both topics. Payload is raw protobuf bytes;
-                        // matcher does an ASCII-byte include of the integer orderId.
-                        s.waitMessage(KAFKA_TOPIC_RECEIVED, {
-                            matcher: (msg) => bytesContainAscii(msg as Uint8Array, orderIdMarker),
-                        })
-                            .timeout(KAFKA_WAIT_MESSAGE_TIMEOUT_MS)
-                            .assert("received event captured", () => true);
-                        s.waitMessage(KAFKA_TOPIC_FINISHED, {
-                            matcher: (msg) => bytesContainAscii(msg as Uint8Array, orderIdMarker),
-                        })
-                            .timeout(KAFKA_WAIT_MESSAGE_TIMEOUT_MS)
-                            .assert("finished event captured", () => true);
-                    },
-                );
-                const result = await scenario.run(tc);
-
-                const subscribeAttachment = writeTextAttachment(
+                writeTextAttachment(
                     ALLURE_DIR,
                     "Kafka subscription",
                     `brokers: ${KAFKA_BROKERS.join(",")}\n` +
-                    `groupId: <random per-run>\n` +
                     `topics:\n  - ${KAFKA_TOPIC_RECEIVED}\n  - ${KAFKA_TOPIC_FINISHED}\n` +
-                    `matcher: bytes include "${orderIdMarker}"`,
+                    `matcher: bytes include "${orderIdMarker}"\n` +
+                    `terminalState: ${polledState ?? "—"}\n` +
+                    `matched: received=${matched.received} finished=${matched.finished}`,
                     "text/plain",
                     "txt",
                 );
-                attachExtrasToLatestAllureResult(ALLURE_DIR, [
-                    {attachment: subscribeAttachment, stepNameIncludes: KAFKA_TOPIC_RECEIVED},
-                ]);
-                labelSuites();
 
                 if (blockReason) expect.fail(blockReason);
-                expect(result.passed, JSON.stringify(result, null, 2)).toBe(true);
-            }, POLL_TIMEOUT_MS + KAFKA_WAIT_MESSAGE_TIMEOUT_MS * 2 + 10_000);
+                expect(
+                    matched.received,
+                    `order.received event for orderId=${emulatorOrderId} not seen within ${KAFKA_WAIT_MESSAGE_TIMEOUT_MS}ms`,
+                ).toBe(true);
+                expect(
+                    matched.finished,
+                    `order.finished event for orderId=${emulatorOrderId} not seen within ${KAFKA_WAIT_MESSAGE_TIMEOUT_MS}ms`,
+                ).toBe(true);
+            }, POLL_TIMEOUT_MS + KAFKA_WAIT_MESSAGE_TIMEOUT_MS * 2 + 30_000);
         },
     );
 });

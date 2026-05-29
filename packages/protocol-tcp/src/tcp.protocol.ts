@@ -1,5 +1,5 @@
 /**
- * TCP Protocol (v2)
+ * TCP Protocol
  *
  * Implements async bidirectional messaging over TCP.
  *
@@ -20,9 +20,9 @@ import type {
 	InferAsyncMessages,
 	ServerProtocolConfig,
 } from "testurio";
-import { BaseAsyncProtocol } from "testurio";
-import { TcpClientAdapter, TcpServerAdapter } from "./tcp.adapters";
-import type { TcpProtocolOptions, TcpServiceDefinition } from "./types";
+import {BaseAsyncProtocol} from "testurio";
+import {TcpClientAdapter, TcpServerAdapter} from "./tcp.adapters";
+import type {TcpProtocolOptions, TcpServiceDefinition} from "./types";
 
 /**
  * Resolve TCP protocol type from generic parameter.

@@ -1,24 +1,25 @@
 <#
 .SYNOPSIS
-  Start kubectl port-forward to Kafka broker pod (test-stable) for local
+  Start kubectl port-forward to ALL Kafka broker pods (test-stable) for local
   Step 7 of mt5-market-symbols-v2 smoke test.
 
 .DESCRIPTION
-  Run in a SEPARATE PowerShell window before the test. Keeps the tunnel
-  alive while the test runs; Ctrl+C to stop. Auto-restarts on transient
-  drop (loop with backoff).
+  test-stable Kafka cluster has 3 brokers (kafka-controller-0/1/2). After the
+  initial metadata exchange kafkajs follows advertised hostnames of EVERY
+  broker, so a single-broker port-forward is not enough -- the client times
+  out with `getaddrinfo ENOTFOUND kafka-controller-1.…`.
 
-  - Tunnel: pod/kafka-controller-0:9092 -> localhost:9092
-  - Pre-flight: ensures the hosts file maps the advertised broker hostname
-    to 127.0.0.1 (interactive elevation if missing).
+  This script:
+  - Maps each broker's advertised hostname to a distinct 127.0.0.X address
+    in the hosts file (interactive elevation if missing).
+  - Spawns one kubectl port-forward per broker, each bound to its own
+    127.0.0.X:9092, all running in background jobs.
+  - Keeps tunnels alive (auto-restart on transient drops).
 
-.PARAMETER LocalPort
-  Local TCP port to bind. Default 9092. Override if 9092 is busy:
-    .\kafka-port-forward.ps1 -LocalPort 9094
-  Then set KAFKA_BROKERS=localhost:9094 before running the test.
+  Run in a SEPARATE PowerShell window before the test. Ctrl+C to stop.
 
-.PARAMETER Pod
-  Broker pod name. Default kafka-controller-0.
+.PARAMETER Namespace
+  Kafka namespace. Default test-stable.
 
 .PARAMETER Kubeconfig
   Path to kubeconfig. Default C:/Users/abolshakov/Documents/k8s/kubeconfig.
@@ -29,8 +30,6 @@
 
 [CmdletBinding()]
 param(
-    [int]$LocalPort = 9092,
-    [string]$Pod = "kafka-controller-0",
     [string]$Namespace = "test-stable",
     [string]$Kubeconfig = "C:/Users/abolshakov/Documents/k8s/kubeconfig",
     [string]$Kubectl = "C:/Users/abolshakov/bin/kubectl.exe"
@@ -38,31 +37,57 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$AdvertisedHost = "$Pod.kafka-controller-headless.$Namespace.svc.cluster.local"
-$HostsPath = "$env:windir\System32\drivers\etc\hosts"
-$HostsLine = "127.0.0.1 $AdvertisedHost"
+$Brokers = @(
+    @{ Pod = "kafka-controller-0"; Address = "127.0.0.1" },
+    @{ Pod = "kafka-controller-1"; Address = "127.0.0.2" },
+    @{ Pod = "kafka-controller-2"; Address = "127.0.0.3" }
+)
 
-function Test-HostsEntry {
-    if (-not (Test-Path $HostsPath)) { return $false }
-    $content = Get-Content -Raw $HostsPath -ErrorAction SilentlyContinue
-    return $content -match [regex]::Escape($AdvertisedHost)
+$HostsPath = "$env:windir\System32\drivers\etc\hosts"
+
+function Get-AdvertisedHost($pod) {
+    return "$pod.kafka-controller-headless.$Namespace.svc.cluster.local"
 }
 
-function Add-HostsEntry {
-    Write-Host "Adding hosts entry (requires admin)..." -ForegroundColor Yellow
-    $cmd = "Add-Content -Path '$HostsPath' -Value '`n$HostsLine' -Encoding ASCII"
+function Test-HostsEntry($Hostname) {
+    if (-not (Test-Path $HostsPath)) { return $false }
+    $content = Get-Content -Raw $HostsPath -ErrorAction SilentlyContinue
+    return $content -match [regex]::Escape($Hostname)
+}
+
+function Add-MissingHostsEntries {
+    $missing = @()
+    foreach ($b in $Brokers) {
+        $h = Get-AdvertisedHost $b.Pod
+        if (-not (Test-HostsEntry $h)) {
+            $missing += "$($b.Address) $h"
+        }
+    }
+    if ($missing.Count -eq 0) {
+        Write-Host "All hosts entries present." -ForegroundColor Green
+        return
+    }
+    Write-Host "Missing hosts entries:" -ForegroundColor Yellow
+    $missing | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+    Write-Host "Elevating to add them (UAC prompt)..." -ForegroundColor Yellow
+
+    $payload = $missing -join "`n"
+    $cmd = "Add-Content -Path '$HostsPath' -Value '`n$payload' -Encoding ASCII"
     try {
         Start-Process powershell -ArgumentList "-NoProfile", "-Command", $cmd -Verb RunAs -Wait
     } catch {
-        Write-Host "Failed to elevate. Add this line manually to $HostsPath:" -ForegroundColor Red
-        Write-Host "  $HostsLine" -ForegroundColor Cyan
+        Write-Host "Failed to elevate. Add these lines manually to ${HostsPath}:" -ForegroundColor Red
+        $missing | ForEach-Object { Write-Host "  $_" -ForegroundColor Cyan }
         exit 1
     }
-    if (-not (Test-HostsEntry)) {
-        Write-Host "Hosts entry still missing after elevation. Aborting." -ForegroundColor Red
-        exit 1
+    foreach ($b in $Brokers) {
+        $h = Get-AdvertisedHost $b.Pod
+        if (-not (Test-HostsEntry $h)) {
+            Write-Host "Hosts entry still missing after elevation: $h. Aborting." -ForegroundColor Red
+            exit 1
+        }
     }
-    Write-Host "Hosts entry added." -ForegroundColor Green
+    Write-Host "Hosts entries added." -ForegroundColor Green
 }
 
 # --- Pre-flight ---
@@ -74,44 +99,59 @@ if (-not (Test-Path $Kubeconfig)) {
     Write-Host "Kubeconfig not found at $Kubeconfig" -ForegroundColor Red
     exit 1
 }
-if (-not (Test-HostsEntry)) {
-    Write-Host "Hosts entry missing: $HostsLine" -ForegroundColor Yellow
-    Add-HostsEntry
-} else {
-    Write-Host "Hosts entry OK: $HostsLine" -ForegroundColor Green
-}
 
-# Ping check
-$ping = Test-Connection -ComputerName $AdvertisedHost -Count 1 -Quiet -ErrorAction SilentlyContinue
-if (-not $ping) {
-    Write-Host "Hosts mapping unreachable via ICMP (firewall?). Continuing — kafkajs uses TCP." -ForegroundColor Yellow
-}
+Add-MissingHostsEntries
 
 Write-Host ""
 Write-Host "=========================================" -ForegroundColor Cyan
-Write-Host " Kafka port-forward — keep this window open" -ForegroundColor Cyan
-Write-Host " pod/$Pod:9092 -> localhost:$LocalPort" -ForegroundColor Cyan
-Write-Host " For the test, run in another shell:" -ForegroundColor Cyan
-if ($LocalPort -ne 9092) {
-    Write-Host "   `$env:KAFKA_BROKERS='localhost:$LocalPort'" -ForegroundColor Gray
+Write-Host " Kafka port-forward (3 brokers)" -ForegroundColor Cyan
+foreach ($b in $Brokers) {
+    Write-Host "  pod/$($b.Pod):9092 -> $($b.Address):9092" -ForegroundColor Cyan
 }
+Write-Host " For the test, run in another shell:" -ForegroundColor Cyan
 Write-Host "   npx vitest run tests/smoke/mt5-market-orders.test.ts" -ForegroundColor Gray
 Write-Host " Ctrl+C to stop." -ForegroundColor Cyan
 Write-Host "=========================================" -ForegroundColor Cyan
 Write-Host ""
 
-# --- Loop: keep tunnel alive across transient drops ---
-$attempt = 0
-while ($true) {
-    $attempt++
-    $stamp = Get-Date -Format "HH:mm:ss"
-    Write-Host "[$stamp] attempt #$attempt — starting tunnel" -ForegroundColor DarkCyan
-    & $Kubectl `
-        --kubeconfig=$Kubeconfig `
-        -n $Namespace `
-        port-forward "pod/$Pod" "${LocalPort}:9092"
-    $code = $LASTEXITCODE
-    $stamp = Get-Date -Format "HH:mm:ss"
-    Write-Host "[$stamp] tunnel exited with code $code, restarting in 3s..." -ForegroundColor Yellow
-    Start-Sleep -Seconds 3
+# Stop any leftover jobs from previous runs
+Get-Job -Name "pf-kafka-*" -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue
+
+# Spawn one job per broker; each job loops with auto-restart
+$jobs = @()
+foreach ($b in $Brokers) {
+    $jobs += Start-Job -Name "pf-kafka-$($b.Pod)" -ScriptBlock {
+        param($pod, $address, $kubectl, $kubeconfig, $namespace)
+        $attempt = 0
+        while ($true) {
+            $attempt++
+            $stamp = Get-Date -Format "HH:mm:ss"
+            Write-Output "[$stamp] $pod attempt #$attempt -- starting tunnel on $address:9092"
+            & $kubectl `
+                --kubeconfig=$kubeconfig `
+                -n $namespace `
+                port-forward "pod/$pod" "9092:9092" `
+                --address $address
+            $code = $LASTEXITCODE
+            $stamp = Get-Date -Format "HH:mm:ss"
+            Write-Output "[$stamp] $pod tunnel exited with code $code, restarting in 3s..."
+            Start-Sleep -Seconds 3
+        }
+    } -ArgumentList $b.Pod, $b.Address, $Kubectl, $Kubeconfig, $Namespace
+}
+
+# Stream output from all jobs until Ctrl+C
+try {
+    while ($true) {
+        foreach ($j in $jobs) {
+            Receive-Job -Job $j | ForEach-Object {
+                Write-Host "[$($j.Name)] $_" -ForegroundColor DarkCyan
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+} finally {
+    Write-Host "Stopping port-forward jobs..." -ForegroundColor Yellow
+    $jobs | Stop-Job -ErrorAction SilentlyContinue
+    $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
 }
