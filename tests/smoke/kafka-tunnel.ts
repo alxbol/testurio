@@ -139,11 +139,11 @@ export async function ensureKafkaTunnels(
     }
 
     if (!kubectlPresent(cfg.kubectl)) {
-        console.warn(`[kafka-tunnel] kubectl not found at "${cfg.kubectl}" — Step 7 will be skipped. ` + `Set KAFKA_PF_KUBECTL to override.`);
+        console.warn(`[kafka-tunnel] kubectl not found at "${cfg.kubectl}" — Step 7 will be skipped. Set KAFKA_PF_KUBECTL to override.`);
         return noop;
     }
     if (!existsSync(cfg.kubeconfig)) {
-        console.warn(`[kafka-tunnel] kubeconfig not found at "${cfg.kubeconfig}" — Step 7 will be skipped. ` + `Set KAFKA_PF_KUBECONFIG to override.`);
+        console.warn(`[kafka-tunnel] kubeconfig not found at "${cfg.kubeconfig}" — Step 7 will be skipped. Set KAFKA_PF_KUBECONFIG to override.`);
         return noop;
     }
 
@@ -172,9 +172,11 @@ export async function ensureKafkaTunnels(
             "--address",
             b.address,
         ];
-        const child = spawn(cfg.kubectl, args, {stdio: ["ignore", "ignore", "pipe"], windowsHide: true});
-        // Surface only hard spawn errors; bind conflicts (parallel files) are
-        // tolerated because readiness is the source of truth below.
+        // stderr is ignored (not piped) so the unread pipe can't fill and stall
+        // kubectl on a long run; child.on("error") still surfaces spawn failures.
+        const child = spawn(cfg.kubectl, args, {stdio: "ignore", windowsHide: true});
+        // Only hard spawn errors are surfaced; bind conflicts are tolerated
+        // because readiness (below) is the source of truth.
         child.on("error", (err) => console.warn(`[kafka-tunnel] ${b.pod} spawn error: ${err.message}`));
         children.push(child);
     }

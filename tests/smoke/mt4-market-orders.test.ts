@@ -11,9 +11,11 @@
  *     https://udamir.github.io/testurio/examples/datasources.html
  *     `store.exec(label, async (db) => db.query<Row>({query}))` patterns.
  *
- *   • Kafka (Step 7) — `Subscriber<OrderEventTopics>` + `KafkaAdapter`
- *     https://udamir.github.io/testurio/examples/message-queues.html
- *     Subscriber MUST be listed before any Publisher in `scenario.components`.
+ *   • Kafka (Step 7) — raw `kafkajs` consumer (NOT @testurio/adapter-kafka).
+ *     The adapter's Subscriber starts its consumer lazily on first waitMessage,
+ *     so it joins the group only AFTER the order is placed and misses the
+ *     bridge's order.received/finished events. We open the consumer and await
+ *     GROUP_JOIN before placing the order to guarantee capture.
  *
  * Kafka requires `kafka:9092` to be reachable from the test runner. The
  * broker is in-cluster (test-stable ns); a port-forward must be set up
@@ -32,18 +34,8 @@ import {readdirSync, readFileSync, statSync, writeFileSync} from "node:fs";
 import {createConnection} from "node:net";
 import {join} from "node:path";
 import {z} from "zod";
-import {
-    Client,
-    type Codec,
-    DataSource,
-    HttpProtocol,
-    type Interaction,
-    Subscriber,
-    testCase,
-    TestScenario,
-} from "testurio";
+import {Client, DataSource, HttpProtocol, type Interaction, testCase, TestScenario,} from "testurio";
 import {ClickHouseAdapter} from "@testurio/adapter-clickhouse";
-import {KafkaAdapter} from "@testurio/adapter-kafka";
 import {AllureReporter} from "@testurio/reporter-allure";
 import {Kafka, logLevel as kafkaLogLevel} from "kafkajs";
 import {beforeAll, describe, expect, it} from "vitest";
@@ -480,7 +472,8 @@ ${body}
 }
 
 // ---------------------------------------------------------------------------
-// Kafka Subscriber (Step 7) — binary protobuf payloads, raw passthrough codec.
+// Kafka (Step 7) — raw kafkajs consumer; binary protobuf payloads matched by
+// ASCII order-id substring. See Step 7 for the lazy-join rationale.
 // ---------------------------------------------------------------------------
 
 const KAFKA_BROKERS = (
@@ -489,32 +482,6 @@ const KAFKA_BROKERS = (
 const KAFKA_TOPIC_RECEIVED = "order.received.v1.demo-uat";
 const KAFKA_TOPIC_FINISHED = "order.finished.v1.demo-uat";
 const KAFKA_WAIT_MESSAGE_TIMEOUT_MS = 30_000;
-
-// Topics map for typed Subscriber. Payload is a Uint8Array — adapter delivers
-// raw bytes from KafkaJS once we hand it the binary passthrough codec below.
-interface OrderEventTopics {
-    [KAFKA_TOPIC_RECEIVED]: Uint8Array;
-    [KAFKA_TOPIC_FINISHED]: Uint8Array;
-}
-
-const rawBytesCodec: Codec<Uint8Array> = {
-    name: "raw-bytes",
-    wireFormat: "binary",
-    encode: <D = unknown>(data: D) => data as unknown as Uint8Array,
-    decode: <D = unknown>(wire: Uint8Array) => wire as unknown as D,
-};
-
-function makeKafkaSubscriber(groupId?: string) {
-    return new Subscriber<OrderEventTopics>("kafka-order-events-sub", {
-        adapter: new KafkaAdapter({
-            brokers: KAFKA_BROKERS,
-            groupId: groupId ?? `mt4-smoke-${randomUUID()}`,
-            // testMode tightens KafkaJS consumer-group coordination for faster rebalancing.
-            testMode: true,
-        }),
-        codec: rawBytesCodec,
-    });
-}
 
 function bytesContainAscii(payload: Uint8Array, needle: string): boolean {
     if (!payload || payload.length === 0) return false;
@@ -1159,9 +1126,9 @@ describe("MT4 | Market order BUY/SELL | parametrized by symbol", () => {
             }, POLL_TIMEOUT_MS + CH_POLL_TIMEOUT_MS + 10_000);
 
             // -----------------------------------------------------------------
-            // Step 7 — Kafka order events via Subscriber + KafkaAdapter.
-            // Subscribers MUST be listed before publishers in scenario.components;
-            // here we have only a subscriber (bridge plays the publisher role).
+            // Step 7 — Kafka order events via raw kafkajs consumer.
+            // Consumer is opened and joined to the group BEFORE the order is
+            // placed (see lazy-join note in the file header).
             // -----------------------------------------------------------------
             it(`Step 7 — Kafka: order.received + order.finished publish a message for our orderId`, async () => {
                 let blockReason: string | undefined;
