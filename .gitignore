@@ -19,3 +19,7 @@ coverage
 CLAUDE.md
 /allure-results/
 /allure-report/
+
+.env
+.env.local
+!.env.example

@@ -1,7 +1,8 @@
 import {defineConfig} from 'vitest/config';
+import {loadEnv} from 'vite';
 import {resolve} from 'node:path';
 
-export default defineConfig({
+export default defineConfig(({mode}) => ({
   test: {
     watch: false,
     fileParallelism: true,
@@ -10,6 +11,8 @@ export default defineConfig({
     testTimeout: 30000,
     hookTimeout: 60000,
     globalSetup: ['./tests/global-setup.ts', './tests/smoke/kafka-tunnel.global-setup.ts'],
+    // Load all keys from .env (empty prefix) into process.env inside tests.
+    env: loadEnv(mode, process.cwd(), ''),
   },
   resolve: {
     alias: {
@@ -27,4 +30,4 @@ export default defineConfig({
       '@testurio/cli': resolve(__dirname, './packages/cli/src'),
     },
   },
-});
+}));

@@ -43,6 +43,7 @@ import {AllureReporter} from "@testurio/reporter-allure";
 import {Kafka, logLevel as kafkaLogLevel} from "kafkajs";
 import {beforeAll, describe, expect, it} from "vitest";
 import {GetV1PingResponse, PostV1OrdersResponse} from "./mt-api.schema";
+import {CH_PASS, CH_URL, CH_USER, MT_HOST} from "./env";
 
 // ---------------------------------------------------------------------------
 // Allure attachment helpers (orthogonal to data source — reused everywhere).
@@ -206,7 +207,6 @@ interface MtEmulatorApi {
     };
 }
 
-const MT_HOST = "192.168.8.46";
 const MT_PORT = 5001;
 
 function makeMtClient() {
@@ -241,9 +241,6 @@ const GetOrderResponseSchema = z.object({code: z.literal(200), body: GetOrderRes
 // ClickHouse DataSource (Steps 5, 6).
 // ---------------------------------------------------------------------------
 
-const CH_URL = "http://clickhouse.test-stable.cbrid.ge:8123";
-const CH_USER = "admin";
-const CH_PASS = "admin";
 const CH_DB = "default";
 const CH_POLL_TIMEOUT_MS = 30_000;
 const CH_POLL_INTERVAL_MS = 1_000;

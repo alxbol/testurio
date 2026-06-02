@@ -30,12 +30,12 @@ import {AllureReporter} from "@testurio/reporter-allure";
 import {Kafka, logLevel as kafkaLogLevel} from "kafkajs";
 import {beforeAll, describe, expect, it} from "vitest";
 import {GetV1PingResponse, PostV1OrdersResponse} from "./mt-api.schema";
+import {CH_PASS, CH_URL, CH_USER, MT_HOST} from "./env";
 
 // ---------------------------------------------------------------------------
 // Scenario parameters.
 // ---------------------------------------------------------------------------
 
-const MT_HOST = "192.168.8.46";
 const MT_PORT = 5001;
 
 const TENANT = "demo-uat";
@@ -49,9 +49,6 @@ const V_CLOSE = 0.001; // half of V_OPEN → partial close
 // demo\forex-hedge-usd-01 group.
 const EXPECTED_ROUTING = "ABOOK";
 
-const CH_URL = "http://clickhouse.test-stable.cbrid.ge:8123";
-const CH_USER = "admin";
-const CH_PASS = "admin";
 const CH_DB = "default";
 const CH_POLL_TIMEOUT_MS = 30_000;
 const CH_POLL_INTERVAL_MS = 1_000;
