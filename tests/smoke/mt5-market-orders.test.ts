@@ -25,8 +25,11 @@
  *   # then add to %WINDIR%/system32/drivers/etc/hosts:
  *   #   127.0.0.1 kafka-controller-0.kafka-controller-headless.test-stable.svc.cluster.local
  *
- * Symbol parametrization: EURUSD.MT5 / GBPUSD.MT5 / XAUUSD.MT5 / NZDUSD.MT5,
- * both BUY and SELL sides; login=123470 (memory: reference_demo_uat_traders).
+ * Symbol parametrization: EURUSD.MT5 / GBPUSD.MT5 / NZDUSD.MT5 expect FILL,
+ * XAUUSD.MT5 expects REJECT (configured gateway-level reject rule: emulator
+ * returns state=CANCELLED comment="REJECTED" and the order never reaches the
+ * bridge — no collector.order/execution rows, no Kafka events). Both BUY and
+ * SELL sides; login is a demo-uat trader in group demo\forex-hedge-usd-01.
  */
 
 import {randomUUID} from "node:crypto";
@@ -244,6 +247,10 @@ const CH_PASS = "admin";
 const CH_DB = "default";
 const CH_POLL_TIMEOUT_MS = 30_000;
 const CH_POLL_INTERVAL_MS = 1_000;
+// Window to confirm a gateway-rejected order did NOT propagate to the bridge.
+// Reject happens before the bridge, so no row should ever appear; we poll
+// briefly to be sure a late row does not sneak in.
+const CH_REJECT_CONFIRM_MS = 8_000;
 
 function makeChDataSource(name = "clickhouse-collector") {
     return new DataSource(name, {
@@ -337,6 +344,17 @@ function buildCollectorOrderSql(emulatorOrderId: number, tenant: string, login: 
               AND client_acc_id = '${login}'
               AND tenant_id = '${tenant}'
               AND is_completed = 1
+            ORDER BY last_modified_at DESC LIMIT 1`;
+}
+
+// Same scope as buildCollectorOrderSql but WITHOUT the is_completed filter, so
+// the reject-path test can assert total absence (no row at any lifecycle stage).
+function buildCollectorOrderAbsenceSql(emulatorOrderId: number, tenant: string, login: number): string {
+    return `SELECT ${COLLECTOR_ORDER_COLUMNS.join(", ")}
+            FROM collector.order
+            WHERE client_order_id = '${emulatorOrderId}'
+              AND client_acc_id = '${login}'
+              AND tenant_id = '${tenant}'
             ORDER BY last_modified_at DESC LIMIT 1`;
 }
 
@@ -482,6 +500,8 @@ const KAFKA_BROKERS = (
 const KAFKA_TOPIC_RECEIVED = "order.received.v1.demo-uat";
 const KAFKA_TOPIC_FINISHED = "order.finished.v1.demo-uat";
 const KAFKA_WAIT_MESSAGE_TIMEOUT_MS = 30_000;
+// Window to confirm a gateway-rejected order produced NO bridge events.
+const KAFKA_REJECT_CONFIRM_MS = 12_000;
 
 function bytesContainAscii(payload: Uint8Array, needle: string): boolean {
     if (!payload || payload.length === 0) return false;
@@ -547,19 +567,30 @@ async function pollUntilTerminal(orderId: number): Promise<{
 // Parametrization.
 // ---------------------------------------------------------------------------
 
+// Expected terminal outcome per symbol.
+//   FILL   — order routes to the bridge, fills A-book, persists collector rows
+//            and publishes order.received/order.finished Kafka events.
+//   REJECT — XAUUSD.MT5 has a configured gateway-level reject rule: the MT plugin
+//            rejects the order (emulator state=CANCELLED, comment="REJECTED")
+//            BEFORE it reaches the bridge, so it produces NO collector.order /
+//            collector.execution rows and NO bridge Kafka events.
+type Outcome = "FILL" | "REJECT";
+const REJECT_COMMENT = "REJECTED";
+
 interface SymbolCase {
     symbol: string;
     tcCode: string;
     login: number;
     volume: number;
     side: "BUY" | "SELL";
+    outcome: Outcome;
 }
 
 const SYMBOL_CASES: SymbolCase[] = (["BUY", "SELL"] as const).flatMap((side) => [
-    {symbol: "EURUSD.MT5", tcCode: "EURUSD", login: 123470, volume: 0.01, side},
-    {symbol: "GBPUSD.MT5", tcCode: "GBPUSD", login: 123470, volume: 0.01, side},
-    {symbol: "XAUUSD.MT5", tcCode: "XAUUSD", login: 123470, volume: 0.01, side},
-    {symbol: "NZDUSD.MT5", tcCode: "NZDUSD", login: 123470, volume: 0.01, side},
+    {symbol: "EURUSD.MT5", tcCode: "EURUSD", login: 333303, volume: 0.001, side, outcome: "FILL"},
+    {symbol: "GBPUSD.MT5", tcCode: "GBPUSD", login: 333303, volume: 0.001, side, outcome: "FILL"},
+    {symbol: "XAUUSD.MT5", tcCode: "XAUUSD", login: 333303, volume: 0.001, side, outcome: "REJECT"},
+    {symbol: "NZDUSD.MT5", tcCode: "NZDUSD", login: 333303, volume: 0.001, side, outcome: "FILL"},
 ]);
 
 const TENANT = "demo-uat";
@@ -611,8 +642,8 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
 
     describe.each(SYMBOL_CASES)(
         "MT5 | Market order $side | $symbol $volume | login $login",
-        ({symbol, tcCode, login, volume, side}) => {
-            const ALLURE_SUITE = allureSuiteFor({symbol, tcCode, login, volume, side});
+        ({symbol, tcCode, login, volume, side, outcome}) => {
+            const ALLURE_SUITE = allureSuiteFor({symbol, tcCode, login, volume, side, outcome});
             const labelSuites = () =>
                 setAllureSuites(ALLURE_DIR, {parentSuite: ALLURE_PARENT_SUITE, suite: ALLURE_SUITE});
 
@@ -765,7 +796,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
             // -----------------------------------------------------------------
             // Step 4 — Strict final-body assertion + CANCELLED diagnostic.
             // -----------------------------------------------------------------
-            it("Step 4 — assert terminal outcome: state=FILLED and full body matches", async () => {
+            it("Step 4 — assert terminal outcome: FILL→state=FILLED / REJECT→state=CANCELLED+comment=REJECTED", async () => {
                 const placed = (await placeAndCaptureOrderId("Step 4")).response;
                 expect(placed.code, JSON.stringify(placed)).toBe("OK");
                 const orderId = placed.orderId;
@@ -810,10 +841,20 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
                     (test) => {
                         const mt = test.use(mtClient);
                         mt.request("getOrder", {method: "GET", path: `/v1/orders/${orderId}`});
-                        mt.onResponse("getOrder")
+                        const chain = mt.onResponse("getOrder")
                             .validate(GetOrderResponseSchema)
-                            .assert("HTTP 200", (res) => res.code === 200)
-                            .assert("state === 'FILLED'", (res) => res.body.state === "FILLED")
+                            .assert("HTTP 200", (res) => res.code === 200);
+                        if (outcome === "FILL") {
+                            chain.assert("state === 'FILLED'", (res) => res.body.state === "FILLED");
+                        } else {
+                            chain
+                                .assert("state === 'CANCELLED'", (res) => res.body.state === "CANCELLED")
+                                .assert(
+                                    "comment === 'REJECTED' (configured gateway reject rule)",
+                                    (res) => res.body.comment === REJECT_COMMENT,
+                                );
+                        }
+                        chain
                             .assert("symbol matches", (res) => res.body.symbol === symbol)
                             .assert("side matches", (res) => res.body.side === side)
                             .assert("type === 'MARKET'", (res) => res.body.type === "MARKET")
@@ -855,14 +896,25 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
                     }
                 }
                 const emulatorOrderId = placeResp?.orderId ?? 0;
-                if (!blockReason && polled && polled.state !== "FILLED") {
-                    blockReason =
-                        `Step 4 precondition: order ${emulatorOrderId} state=${polled.state} ` +
-                        `comment=${JSON.stringify(polled.lastBody.comment ?? "")} — Step 5 cannot validate persistence`;
+                if (!blockReason && polled) {
+                    if (outcome === "FILL" && polled.state !== "FILLED") {
+                        blockReason =
+                            `Step 4 precondition: order ${emulatorOrderId} state=${polled.state} ` +
+                            `comment=${JSON.stringify(polled.lastBody.comment ?? "")} — Step 5 cannot validate persistence`;
+                    } else if (
+                        outcome === "REJECT" &&
+                        !(polled.state === "CANCELLED" && polled.lastBody.comment === REJECT_COMMENT)
+                    ) {
+                        blockReason =
+                            `Step 4 precondition (REJECT): order ${emulatorOrderId} expected CANCELLED/"${REJECT_COMMENT}" ` +
+                            `but got state=${polled.state} comment=${JSON.stringify(polled.lastBody.comment ?? "")}`;
+                    }
                 }
 
                 const sql = emulatorOrderId
-                    ? buildCollectorOrderSql(emulatorOrderId, TENANT, login)
+                    ? outcome === "FILL"
+                        ? buildCollectorOrderSql(emulatorOrderId, TENANT, login)
+                        : buildCollectorOrderAbsenceSql(emulatorOrderId, TENANT, login)
                     : "-- order was not placed";
 
                 const ch = makeChDataSource();
@@ -895,41 +947,62 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
                     `chOrder ${symbol} ${side} login=${login} emulatorOrderId=${emulatorOrderId}`,
                     (test) => {
                         const store = test.use(ch);
-                        store
-                            .exec("wait for collector.order row", async (db) => {
-                                if (blockReason) return undefined;
-                                const deadline = Date.now() + CH_POLL_TIMEOUT_MS;
-                                while (Date.now() < deadline) {
-                                    chPolls++;
-                                    const rows = await db.query<CollectorOrderRow>({query: sql});
-                                    if (rows.length === 1) return rows[0];
-                                    await new Promise((res) => setTimeout(res, CH_POLL_INTERVAL_MS));
-                                }
-                                return undefined;
-                            })
-                            .assert("collector.order row present", (r) => {
-                                row = r as CollectorOrderRow | undefined;
-                                return row !== undefined;
-                            })
-                            .assert("client_order_id matches", () => row?.client_order_id === String(emulatorOrderId))
-                            .assert("tenant_id = demo-uat", () => row?.tenant_id === TENANT)
-                            .assert("client_acc_id matches", () => row?.client_acc_id === String(login))
-                            .assert("client_symbol_name matches", () => row?.client_symbol_name === symbol)
-                            .assert("side matches", () => row?.side === side)
-                            .assert("order_type = MARKET", () => row?.order_type === "MARKET")
-                            .assert("bridge_status = FILLED", () => row?.bridge_status === "FILLED")
-                            .assert("client_status = FILLED", () => row?.client_status === "FILLED")
-                            .assert("lp_status = FILLED", () => row?.lp_status === "FILLED")
-                            .assert("server_type = MT5", () => row?.server_type === "MT5")
-                            .assert("is_completed = 1", () => row?.is_completed === 1)
-                            .assert("is_order_received = 1", () => row?.is_order_received === 1)
-                            .assert("is_final_order_received = 1", () => row?.is_final_order_received === 1)
-                            .assert("reject_text empty", () => row?.reject_text === "")
-                            .assert("lp_request_at NOT NULL", () => row?.lp_request_at !== null)
-                            .assert(
-                                "client_amount_filled === requested_core_amount",
-                                () => row?.client_amount_filled === row?.requested_core_amount,
-                            );
+                        if (outcome === "REJECT") {
+                            store
+                                .exec("confirm collector.order has NO row (gateway reject, not propagated to bridge)", async (db) => {
+                                    if (blockReason) return [] as CollectorOrderRow[];
+                                    const deadline = Date.now() + CH_REJECT_CONFIRM_MS;
+                                    let rows: CollectorOrderRow[] = [];
+                                    while (Date.now() < deadline) {
+                                        chPolls++;
+                                        rows = await db.query<CollectorOrderRow>({query: sql});
+                                        if (rows.length > 0) return rows; // unexpected — fail fast
+                                        await new Promise((res) => setTimeout(res, CH_POLL_INTERVAL_MS));
+                                    }
+                                    return rows;
+                                })
+                                .assert("no collector.order row (reject not propagated to bridge)", (r) => {
+                                    const rows = r as CollectorOrderRow[];
+                                    row = rows[0];
+                                    return rows.length === 0;
+                                });
+                        } else {
+                            store
+                                .exec("wait for collector.order row", async (db) => {
+                                    if (blockReason) return undefined;
+                                    const deadline = Date.now() + CH_POLL_TIMEOUT_MS;
+                                    while (Date.now() < deadline) {
+                                        chPolls++;
+                                        const rows = await db.query<CollectorOrderRow>({query: sql});
+                                        if (rows.length === 1) return rows[0];
+                                        await new Promise((res) => setTimeout(res, CH_POLL_INTERVAL_MS));
+                                    }
+                                    return undefined;
+                                })
+                                .assert("collector.order row present", (r) => {
+                                    row = r as CollectorOrderRow | undefined;
+                                    return row !== undefined;
+                                })
+                                .assert("client_order_id matches", () => row?.client_order_id === String(emulatorOrderId))
+                                .assert("tenant_id = demo-uat", () => row?.tenant_id === TENANT)
+                                .assert("client_acc_id matches", () => row?.client_acc_id === String(login))
+                                .assert("client_symbol_name matches", () => row?.client_symbol_name === symbol)
+                                .assert("side matches", () => row?.side === side)
+                                .assert("order_type = MARKET", () => row?.order_type === "MARKET")
+                                .assert("bridge_status = FILLED", () => row?.bridge_status === "FILLED")
+                                .assert("client_status = FILLED", () => row?.client_status === "FILLED")
+                                .assert("lp_status = FILLED", () => row?.lp_status === "FILLED")
+                                .assert("server_type = MT5", () => row?.server_type === "MT5")
+                                .assert("is_completed = 1", () => row?.is_completed === 1)
+                                .assert("is_order_received = 1", () => row?.is_order_received === 1)
+                                .assert("is_final_order_received = 1", () => row?.is_final_order_received === 1)
+                                .assert("reject_text empty", () => row?.reject_text === "")
+                                .assert("lp_request_at NOT NULL", () => row?.lp_request_at !== null)
+                                .assert(
+                                    "client_amount_filled === requested_core_amount",
+                                    () => row?.client_amount_filled === row?.requested_core_amount,
+                                );
+                        }
                     },
                 );
                 const result = await scenario.run(tc);
@@ -983,10 +1056,19 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
                     }
                 }
                 const emulatorOrderId = placeResp?.orderId ?? 0;
-                if (!blockReason && polled && polled.state !== "FILLED") {
-                    blockReason =
-                        `Step 4 precondition: order ${emulatorOrderId} state=${polled.state} ` +
-                        `comment=${JSON.stringify(polled.lastBody.comment ?? "")}`;
+                if (!blockReason && polled) {
+                    if (outcome === "FILL" && polled.state !== "FILLED") {
+                        blockReason =
+                            `Step 4 precondition: order ${emulatorOrderId} state=${polled.state} ` +
+                            `comment=${JSON.stringify(polled.lastBody.comment ?? "")}`;
+                    } else if (
+                        outcome === "REJECT" &&
+                        !(polled.state === "CANCELLED" && polled.lastBody.comment === REJECT_COMMENT)
+                    ) {
+                        blockReason =
+                            `Step 4 precondition (REJECT): order ${emulatorOrderId} expected CANCELLED/"${REJECT_COMMENT}" ` +
+                            `but got state=${polled.state} comment=${JSON.stringify(polled.lastBody.comment ?? "")}`;
+                    }
                 }
 
                 const sql = emulatorOrderId
@@ -1025,7 +1107,25 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
                     `chExecutions ${symbol} ${side} login=${login} emulatorOrderId=${emulatorOrderId}`,
                     (test) => {
                         const store = test.use(ch);
-                        store
+                        if (outcome === "REJECT") {
+                            store
+                                .exec("confirm collector.execution has NO rows (gateway reject)", async (db) => {
+                                    if (blockReason) return [] as CollectorExecutionRow[];
+                                    const deadline = Date.now() + CH_REJECT_CONFIRM_MS;
+                                    let rows: CollectorExecutionRow[] = [];
+                                    while (Date.now() < deadline) {
+                                        rows = await db.query<CollectorExecutionRow>({query: sql});
+                                        if (rows.length > 0) return rows; // unexpected — fail fast
+                                        await new Promise((res) => setTimeout(res, CH_POLL_INTERVAL_MS));
+                                    }
+                                    return rows;
+                                })
+                                .assert("no collector.execution rows (reject not propagated to bridge)", (r) => {
+                                    execRows = r as CollectorExecutionRow[];
+                                    return execRows.length === 0;
+                                });
+                        } else {
+                            store
                             .exec("wait for collector.execution rows", async (db) => {
                                 if (blockReason) return [];
                                 const deadline = Date.now() + CH_POLL_TIMEOUT_MS;
@@ -1094,6 +1194,7 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
                                 "SUM(client_amount_filled WHERE FILLED) > 0",
                                 () => sumFilledVolume > 0,
                             );
+                        }
                     },
                 );
                 const result = await scenario.run(tc);
@@ -1212,17 +1313,30 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
                             orderIdMarker = String(emulatorOrderId);
                             const polled = await pollUntilTerminal(emulatorOrderId);
                             polledState = polled.state;
-                            if (polled.state !== "FILLED") {
-                                blockReason =
-                                    `Step 4 precondition: order ${emulatorOrderId} state=${polled.state} ` +
-                                    `comment=${JSON.stringify(polled.lastBody.comment ?? "")}`;
+                            if (outcome === "FILL") {
+                                if (polled.state !== "FILLED") {
+                                    blockReason =
+                                        `Step 4 precondition: order ${emulatorOrderId} state=${polled.state} ` +
+                                        `comment=${JSON.stringify(polled.lastBody.comment ?? "")}`;
+                                } else {
+                                    // Race: messages may have arrived for prior orders before
+                                    // orderIdMarker was set; eachMessage now starts matching.
+                                    await Promise.race([
+                                        bothMatched,
+                                        new Promise<void>((res) => setTimeout(res, KAFKA_WAIT_MESSAGE_TIMEOUT_MS)),
+                                    ]);
+                                }
                             } else {
-                                // Race: messages may have arrived for prior orders before
-                                // orderIdMarker was set; eachMessage now starts matching.
-                                await Promise.race([
-                                    bothMatched,
-                                    new Promise<void>((res) => setTimeout(res, KAFKA_WAIT_MESSAGE_TIMEOUT_MS)),
-                                ]);
+                                // REJECT: order rejected at the gateway before the bridge,
+                                // so no order.received/order.finished should be published.
+                                if (!(polled.state === "CANCELLED" && polled.lastBody.comment === REJECT_COMMENT)) {
+                                    blockReason =
+                                        `Step 4 precondition (REJECT): order ${emulatorOrderId} expected CANCELLED/"${REJECT_COMMENT}" ` +
+                                        `but got state=${polled.state} comment=${JSON.stringify(polled.lastBody.comment ?? "")}`;
+                                } else {
+                                    // Wait the confirm window; nothing should match.
+                                    await new Promise<void>((res) => setTimeout(res, KAFKA_REJECT_CONFIRM_MS));
+                                }
                             }
                         }
                     }
@@ -1247,14 +1361,25 @@ describe("MT5 | Market order BUY/SELL | parametrized by symbol", () => {
                 );
 
                 if (blockReason) expect.fail(blockReason);
-                expect(
-                    matched.received,
-                    `order.received event for orderId=${emulatorOrderId} not seen within ${KAFKA_WAIT_MESSAGE_TIMEOUT_MS}ms`,
-                ).toBe(true);
-                expect(
-                    matched.finished,
-                    `order.finished event for orderId=${emulatorOrderId} not seen within ${KAFKA_WAIT_MESSAGE_TIMEOUT_MS}ms`,
-                ).toBe(true);
+                if (outcome === "FILL") {
+                    expect(
+                        matched.received,
+                        `order.received event for orderId=${emulatorOrderId} not seen within ${KAFKA_WAIT_MESSAGE_TIMEOUT_MS}ms`,
+                    ).toBe(true);
+                    expect(
+                        matched.finished,
+                        `order.finished event for orderId=${emulatorOrderId} not seen within ${KAFKA_WAIT_MESSAGE_TIMEOUT_MS}ms`,
+                    ).toBe(true);
+                } else {
+                    expect(
+                        matched.received,
+                        `unexpected order.received event for gateway-rejected orderId=${emulatorOrderId}`,
+                    ).toBe(false);
+                    expect(
+                        matched.finished,
+                        `unexpected order.finished event for gateway-rejected orderId=${emulatorOrderId}`,
+                    ).toBe(false);
+                }
             }, POLL_TIMEOUT_MS + KAFKA_WAIT_MESSAGE_TIMEOUT_MS * 2 + 30_000);
         },
     );
